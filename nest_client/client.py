@@ -35,6 +35,7 @@ import threading
 import time
 from typing import Any, Dict, Optional, Union
 
+from .config import DEFAULT_URL, DEFAULT_TIMEOUT
 
 #  WebSockets import (compatible with v13+)
 try:
@@ -71,7 +72,7 @@ from .exceptions import NestError, NestTimeoutError
 class AsyncNestClient:
     """Asynchronous WebSocket client for the CHESS NEST simulator."""
 
-    def __init__(self, url: str = "ws://localhost:8080/ws", default_timeout: float = 10.0):
+    def __init__(self, url: str = DEFAULT_URL, default_timeout: float = DEFAULT_TIMEOUT):
         self.url = url
         self.ws: Optional[WebSocketClientProtocol] = None
         self._recv_task: Optional[asyncio.Task] = None
@@ -261,8 +262,7 @@ class NestClient:
         client.stop()
         client.disconnect()
     """
-
-    def __init__(self, url: str = "ws://localhost:8080/ws", default_timeout: float = 10.0):
+    def __init__(self, url: str = DEFAULT_URL, default_timeout: float = DEFAULT_TIMEOUT):
         self._url = url
         self._default_timeout = default_timeout
         self._loop = asyncio.new_event_loop()
