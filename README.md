@@ -8,7 +8,6 @@ This client can:
 - Start and stop simulations
 - Receive real-time logs, status updates, and events
 
----
 
 ## 🚀 Installation
 
@@ -45,7 +44,6 @@ You should see:
 listening on http://127.0.0.1:3000
 ```
 
----
 
 ## 🧠 Basic usage
 
@@ -64,7 +62,6 @@ print(status)
 client.stop()
 client.disconnect()
 ```
----
 
 ## 🧩 Example scripts
 
@@ -78,7 +75,6 @@ Or use the helper script:
 bash scripts/run_poc.sh
 ```
 
----
 
 ## ⚠️ Requirements
 
@@ -86,8 +82,3 @@ bash scripts/run_poc.sh
 - Websockets 12+
 - A running instance of the NEST simulator (`cargo run` from the main repo)
 
----
-
-## 📄 License
-
-MIT License © 2025 CHESS Mission
