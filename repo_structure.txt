@@ -1,0 +1,160 @@
+nest-python-client/
+│
+├── README.md
+├── LICENSE
+│
+├── pyproject.toml
+│   # Defines project metadata and dependencies (modern Python packaging standard).
+│   # Used by Poetry or setuptools to build and install the library.
+│   # Includes project name, version, dependencies, dev dependencies, and build backend.
+│
+├── requirements.txt
+│   # Plain text list of dependencies, mostly for developers or CI environments.
+│   # Mirrors what is in pyproject.toml but is useful for quick installation via pip.
+│
+├── .gitignore
+│   # Lists files and folders that Git should ignore.
+│   # Prevents committing unnecessary artifacts (bytecode, cache, logs, virtualenvs, etc.).
+│
+├── .env.example
+│   # Example file showing environment variables that can be used by the client.
+│   # For example, it may contain WS_URL, AUTH_TOKEN, or LOG_LEVEL variables.
+│
+├── .github/
+│   # Directory containing GitHub-specific configuration files.
+│
+│   └── workflows/
+│       # Folder for GitHub Actions workflow definitions.
+│
+│       └── ci.yml
+│           # Continuous Integration configuration file.
+│           # Defines automatic actions such as running tests, linting, or packaging checks.
+│           # Triggered when code is pushed or a pull request is opened.
+│
+├── nest_client/
+│   # The main Python package implementing the client library.
+│   # This folder contains all source code for the library.
+│
+│   ├── __init__.py
+│   │   # Marks the folder as a Python package.
+│   │   # Can also define package-level imports or version information.
+│   │
+│   ├── client.py
+│   │   # Core implementation of the Python client.
+│   │   # Contains the AsyncNestClient class and possibly a synchronous wrapper.
+│   │   # Responsible for WebSocket connection handling, sending commands, 
+│   │   # receiving messages, event dispatching, and logging.
+│   │
+│   ├── scenario.py
+│   │   # Implements a simple scenario runner or scripting interface.
+│   │   # Allows defining sequences of commands (start, set_env, send_command, etc.)
+│   │   # that can be executed automatically, similar to test sequences in fpseq.
+│   │
+│   ├── topology.py
+│   │   # Responsible for parsing and validating topology YAML files.
+│   │   # Uses rules defined in the NEST Topology Specification document.
+│   │   # Ensures all components, ports, and wires are well-defined before uploading.
+│   │
+│   ├── utils.py
+│   │   # General utility functions used throughout the package.
+│   │   # Examples: unique ID generation, logging setup, message formatting,
+│   │   # async helper functions, or timeout management.
+│   │
+│   ├── exceptions.py
+│   │   # Defines custom exception classes for the client.
+│   │   # For example: ConnectionError, InvalidMessageError, or TimeoutError.
+│   │   # Makes error handling cleaner and more descriptive.
+│   │
+│   ├── types.py
+│   │   # Contains data classes or TypedDict definitions for structured messages.
+│   │   # Provides type hints for message formats exchanged with the NEST WebSocket API.
+│   │   # Helps ensure consistency between client and server communication.
+│   │
+│   ├── config.py
+│   │   # Central place for configuration constants.
+│   │   # Example: default WebSocket URL, default timeouts, log levels, or buffer sizes.
+│   │
+│   └── __version__.py
+│       # Stores the package version number (e.g., "0.1.0").
+│       # Used for distribution and user-facing version checks.
+│
+├── examples/
+│   # Contains example scripts demonstrating how to use the Python client.
+│   # These scripts serve as tutorials or proof-of-concept demonstrations.
+│
+│   ├── minimal_poc.py
+│   │   # The minimal proof-of-concept example.
+│   │   # Connects to the NEST WebSocket, uploads a topology, starts and stops a simulation,
+│   │   # and prints received log or status messages.
+│   │
+│   ├── topology_example.yaml
+│   │   # Example YAML topology file used by minimal_poc.py.
+│   │   # Shows the expected structure and syntax for defining a topology.
+│   │
+│   ├── scenario_basic.py
+│   │   # Example of running a scripted simulation sequence.
+│   │   # Demonstrates the scenario runner and how to automate simulation steps.
+│   │
+│   └── interactive_shell.py
+│       # Optional interactive command-line tool.
+│       # Allows manually connecting to the simulator and sending commands via terminal input.
+│
+├── tests/
+│   # Contains all test files for unit, integration, and regression testing.
+│   # Uses pytest as the main testing framework.
+│
+│   ├── __init__.py
+│   │
+│   ├── test_client.py
+│   │   # Tests the core client behavior: connection, start/stop, message handling.
+│   │   # Typically mocks the WebSocket server for isolated unit testing.
+│   │
+│   ├── test_topology.py
+│   │   # Tests the topology parser and validator.
+│   │   # Ensures it correctly accepts valid YAMLs and rejects invalid ones.
+│   │
+│   ├── test_scenario.py
+│   │   # Tests the scenario runner logic and sequence execution.
+│   │   # Verifies that actions execute in order and produce expected WebSocket messages.
+│   │
+│   └── fixtures/
+│       # Contains static files and scripts used for testing.
+│       # Keeps reusable resources separate from test logic.
+│
+│       ├── fake_topology.yaml
+│       │   # A minimal fake topology used for testing topology loading.
+│       │
+│       └── mock_server.py
+│           # Implements a fake WebSocket server for integration tests.
+│           # Simulates NEST behavior by responding to commands and sending events/logs.
+│
+├── scripts/
+│   # Contains auxiliary shell scripts for developers.
+│   # These are not part of the library itself but make development easier.
+│
+│   ├── run_poc.sh
+│   │   # Shell script to quickly execute the minimal proof-of-concept example.
+│   │   # Example content: "python examples/minimal_poc.py"
+│   │
+│   └── format.sh
+│       # Script for automatically formatting and linting the codebase.
+│       # Example: runs black, isort, and flake8 sequentially.
+│
+└── docs/
+    # Documentation directory for developers and contributors.
+    # Can include diagrams, API references, and detailed explanations.
+    #
+    ├── api_reference.md
+    │   # Describes each public class and method in the client library.
+    │   # Serves as a generated or manually written API reference.
+    │
+    ├── developer_guide.md
+    │   # Internal guide for contributors explaining design decisions,
+    │   # development workflow, and contribution guidelines.
+    │
+    ├── examples.md
+    │   # Explains how to run each example and what it demonstrates.
+    │
+    └── architecture.png
+        # Optional diagram showing the high-level architecture of NEST and its client.
+        # Useful for presentations and technical documentation.
