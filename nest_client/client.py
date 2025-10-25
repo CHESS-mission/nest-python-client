@@ -35,8 +35,19 @@ import threading
 import time
 from typing import Any, Dict, Optional, Union
 
-import websockets
-from websockets.legacy.client import WebSocketClientProtocol
+
+#  WebSockets import (compatible with v13+)
+try:
+    from websockets.asyncio.client import connect, ClientConnection  # type: ignore[attr-defined]
+except ImportError:
+    try:
+        from websockets.client import connect, ClientConnection       # type: ignore[attr-defined]
+    except ImportError:
+        from websockets.legacy.client import connect, WebSocketClientProtocol as ClientConnection  # type: ignore[attr-defined]
+
+WebSocketClientProtocol = ClientConnection  # type: ignore[attr-defined]
+
+
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
@@ -57,113 +68,6 @@ class NestError(Exception):
 
 class NestTimeoutError(NestError):
     """Raised when waiting for a message times out."""
-
-# ----------------------------------------------------------------------
-# Synchronous wrapper
-# ----------------------------------------------------------------------
-
-class NestClient:
-    """
-    Synchronous (blocking) wrapper for AsyncNestClient.
-
-    Example:
-        from nest_client.client import NestClient
-
-        client = NestClient("ws://localhost:8080/ws")
-        client.connect()
-        client.upload_topology(open("topology.yaml").read())
-        client.start()
-        log = client.wait_for_log(timeout=5)
-        client.stop()
-        client.disconnect()
-    """
-
-    def __init__(self, url: str = "ws://localhost:8080/ws", default_timeout: float = 10.0):
-        self._url = url
-        self._default_timeout = default_timeout
-        self._loop = asyncio.new_event_loop()
-        self._thread: Optional[threading.Thread] = None
-        self._async_client: Optional[AsyncNestClient] = None
-        self._stop_event = threading.Event()
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-    def _run_loop(self):
-        asyncio.set_event_loop(self._loop)
-        self._loop.run_forever()
-
-    def _run(self, coro):
-        fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return fut.result()
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-    def connect(self) -> None:
-        """Start background event loop and connect."""
-        if self._thread and self._thread.is_alive():
-            raise NestError("Already connected.")
-        self._async_client = AsyncNestClient(self._url, self._default_timeout)
-        self._thread = threading.Thread(target=self._run_loop, daemon=True)
-        self._thread.start()
-        self._run(self._async_client.connect)
-
-    def disconnect(self) -> None:
-        """Disconnect and stop the background loop."""
-        if not self._async_client:
-            return
-        self._run(self._async_client.disconnect())
-        self._loop.call_soon_threadsafe(self._loop.stop)
-        if self._thread:
-            self._thread.join(timeout=1)
-        self._thread = None
-        self._async_client = None
-
-    # ------------------------------------------------------------------
-    # Client actions
-    # ------------------------------------------------------------------
-    def start(self): self._run(self._async_client.start())
-    def stop(self): self._run(self._async_client.stop())
-
-    def upload_topology(self, yaml: Union[str, bytes]):
-        if isinstance(yaml, bytes):
-            yaml = yaml.decode("utf-8")
-        self._run(self._async_client.upload_topology(yaml))
-
-    def set_env(self, variable: str, value: Any):
-        self._run(self._async_client.set_env(variable, value))
-
-    def send_command(self, component: str, command: str, arguments: Optional[Dict[str, Any]] = None):
-        self._run(self._async_client.send_command(component, command, arguments))
-
-    # ------------------------------------------------------------------
-    # Waiters (blocking)
-    # ------------------------------------------------------------------
-    def wait_for_status(self, state: str, timeout: Optional[float] = None) -> Dict[str, Any]:
-        return self._run(self._async_client.wait_for_status(state, timeout))
-
-    def wait_for_log(self, level: Optional[str] = None, timeout: Optional[float] = None) -> Dict[str, Any]:
-        return self._run(self._async_client.wait_for_log(level, timeout))
-
-    def wait_for_event(
-        self, component: Optional[str] = None, event: Optional[str] = None, timeout: Optional[float] = None
-    ) -> Dict[str, Any]:
-        return self._run(self._async_client.wait_for_event(component, event, timeout))
-
-    # ------------------------------------------------------------------
-    # Convenience
-    # ------------------------------------------------------------------
-    def __enter__(self):
-        self.connect()
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        try:
-            self.disconnect()
-        except Exception:
-            pass
-
 
 # ----------------------------------------------------------------------
 # Asynchronous client (core implementation)
@@ -189,12 +93,13 @@ class AsyncNestClient:
         """Connect to the NEST WebSocket server."""
         logger.info("Connecting to NEST at %s", self.url)
         try:
-            self.ws = await websockets.connect(self.url)
+            self.ws = await connect(self.url)  # type: ignore[attr-defined]
             self._connected.set()
             self._recv_task = asyncio.create_task(self._recv_loop(), name="nest_recv")
             logger.info("Connected.")
         except Exception as e:
             raise NestError(f"Failed to connect: {e}") from e
+
 
     async def disconnect(self) -> None:
         """Disconnect cleanly from the server."""
@@ -208,7 +113,7 @@ class AsyncNestClient:
             except asyncio.CancelledError:
                 pass
         try:
-            await self.ws.close()
+            await self.ws.close()  # type: ignore[attr-defined]
         finally:
             self.ws = None
             self._connected.clear()
@@ -218,12 +123,25 @@ class AsyncNestClient:
     # Sending actions (client → server)
     # ------------------------------------------------------------------
     async def _send(self, payload: Dict[str, Any]) -> None:
-        if not self.ws or self.ws.closed:
+        """Safely send a JSON payload over the WebSocket connection."""
+        if not self.ws:
             raise NestError("WebSocket is not connected.")
+
+        # Handle modern websockets API (v12+)
+        try:
+            if getattr(self.ws, "closed", False):
+                raise NestError("WebSocket connection already closed.")
+        except Exception:
+            pass  # `.closed` may not exist or be awaitable, so we ignore
+
         msg = json.dumps(payload)
         async with self._send_lock:
-            await self.ws.send(msg)
-            logger.debug("Sent: %s", msg)
+            try:
+                await self.ws.send(msg)  # type: ignore[attr-defined]
+                logger.debug("Sent: %s", msg)
+            except Exception as e:
+                raise NestError(f"Failed to send message: {e}") from e
+
 
     async def start(self) -> None:
         await self._send({"action": "start"})
@@ -250,8 +168,9 @@ class AsyncNestClient:
     # ------------------------------------------------------------------
     async def _recv_loop(self) -> None:
         """Background loop: receives and enqueues messages."""
+        assert self.ws is not None, "WebSocket not connected"
         try:
-            async for raw in self.ws:
+            async for raw in self.ws:  # type: ignore[attr-defined]
                 try:
                     msg = json.loads(raw)
                 except json.JSONDecodeError:
@@ -326,4 +245,146 @@ class AsyncNestClient:
                     event is None or msg.get("event") == event
                 ):
                     return msg
+
+
+# ----------------------------------------------------------------------
+# Synchronous wrapper
+# ----------------------------------------------------------------------
+
+class NestClient:
+    """
+    Synchronous (blocking) wrapper for AsyncNestClient.
+
+    Example:
+        from nest_client.client import NestClient
+
+        client = NestClient("ws://localhost:8080/ws")
+        client.connect()
+        client.upload_topology(open("topology.yaml").read())
+        client.start()
+        log = client.wait_for_log(timeout=5)
+        client.stop()
+        client.disconnect()
+    """
+
+    def __init__(self, url: str = "ws://localhost:8080/ws", default_timeout: float = 10.0):
+        self._url = url
+        self._default_timeout = default_timeout
+        self._loop = asyncio.new_event_loop()
+        self._thread: Optional[threading.Thread] = None
+        self._async_client: Optional[AsyncNestClient] = None
+        self._stop_event = threading.Event()
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+    def _run_loop(self):
+        """Run asyncio event loop in a background thread."""
+        asyncio.set_event_loop(self._loop)
+        try:
+            self._loop.run_forever()
+        finally:
+            self._loop.close()
+
+    def _run(self, coro):
+        """Submit a coroutine to the running loop and return its result."""
+        if not asyncio.iscoroutine(coro):
+            raise TypeError(f"Expected coroutine, got {type(coro)}")
+        fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return fut.result()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+    def connect(self) -> None:
+        """Start background event loop and connect to the NEST server."""
+        if self._thread and self._thread.is_alive():
+            raise NestError("Already connected.")
+        self._async_client = AsyncNestClient(self._url, self._default_timeout)
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+        # Corrected: call coroutine, not pass function
+        self._run(self._async_client.connect())
+
+    def disconnect(self) -> None:
+        """Disconnect and stop the background loop."""
+        if not self._async_client:
+            return
+        # Corrected: call coroutine
+        self._run(self._async_client.disconnect())
+        # Gracefully stop event loop
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._thread:
+            self._thread.join(timeout=1)
+        self._thread = None
+        self._async_client = None
+
+    # ------------------------------------------------------------------
+    # Client actions
+    # ------------------------------------------------------------------
+    def start(self) -> None:
+        """Send 'start' command to the simulator."""
+        assert self._async_client is not None, "Client is not connected"
+        self._run(self._async_client.start())
+
+    def stop(self) -> None:
+        """Send 'stop' command to the simulator."""
+        assert self._async_client is not None, "Client is not connected"
+        self._run(self._async_client.stop())
+
+    def upload_topology(self, yaml: str | bytes) -> None:
+        """Upload topology YAML string to the simulator."""
+        if isinstance(yaml, bytes):
+            yaml = yaml.decode("utf-8")
+        assert isinstance(yaml, str)    
+        assert self._async_client is not None, "Client is not connected"
+        self._run(self._async_client.upload_topology(yaml))
+
+
+    def set_env(self, variable: str, value: Any) -> None:
+        """Set an environment variable in the simulator."""
+        assert self._async_client is not None, "Client is not connected"
+        self._run(self._async_client.set_env(variable, value))
+
+    def send_command(
+        self, component: str, command: str, arguments: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Send a command to a specific component."""
+        assert self._async_client is not None, "Client is not connected"
+        self._run(self._async_client.send_command(component, command, arguments))
+
+    # ------------------------------------------------------------------
+    # Waiters (blocking)
+    # ------------------------------------------------------------------
+    def wait_for_status(self, state: str, timeout: Optional[float] = None) -> Dict[str, Any]:
+        """Block until simulator reaches a given state (idle/ready/running)."""
+        assert self._async_client is not None, "Client is not connected"
+        return self._run(self._async_client.wait_for_status(state, timeout))
+
+    def wait_for_log(self, level: Optional[str] = None, timeout: Optional[float] = None) -> Dict[str, Any]:
+        """Block until a log message arrives (optionally filtered by level)."""
+        assert self._async_client is not None, "Client is not connected"
+        return self._run(self._async_client.wait_for_log(level, timeout))
+
+    def wait_for_event(
+        self, component: Optional[str] = None, event: Optional[str] = None, timeout: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """Block until a matching event is received."""
+        assert self._async_client is not None, "Client is not connected"
+        return self._run(self._async_client.wait_for_event(component, event, timeout))
+
+    # ------------------------------------------------------------------
+    # Convenience
+    # ------------------------------------------------------------------
+    def __enter__(self):
+        """Enable use as a context manager."""
+        self.connect()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        """Ensure clean disconnection on context exit."""
+        try:
+            self.disconnect()
+        except Exception:
+            pass
 
