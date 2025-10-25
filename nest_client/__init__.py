@@ -10,3 +10,6 @@ from .client import NestClient, AsyncNestClient
 from .exceptions import NestError, NestTimeoutError
 
 __all__ = ["NestClient", "AsyncNestClient", "NestError", "NestTimeoutError"]
+
+from .__version__ import __version__
+__all__.append("__version__")

@@ -12,4 +12,4 @@ def load_yaml(path: str) -> str:
 
 def pretty_json(obj: dict) -> str:
     """Return a nicely formatted JSON string for debug/logging."""
-    return json.dumps(obj, indent=2, ensure_ascii=False)
+    return json.dumps(obj, indent=4, ensure_ascii=False)
