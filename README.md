@@ -9,7 +9,7 @@ This client can:
 - Receive real-time logs, status updates, and events
 
 
-## 🚀 Installation
+## Installation
 
 1. Clone the repository:
 ```
@@ -30,7 +30,7 @@ pip install -r requirements.txt
 
 ---
 
-## ⚙️ Running the NEST simulator
+## Running the NEST simulator
 
 Before running the Python client, start the simulator from the main NEST repository:
 
@@ -45,7 +45,7 @@ listening on http://127.0.0.1:3000
 ```
 
 
-## 🧠 Basic usage
+## Basic usage
 
 ```
 from nest_client import NestClient
@@ -63,7 +63,7 @@ client.stop()
 client.disconnect()
 ```
 
-## 🧩 Example scripts
+## Example scripts
 
 You can run included examples directly:
 ```
