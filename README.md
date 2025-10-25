@@ -76,7 +76,7 @@ bash scripts/run_poc.sh
 ```
 
 
-## ⚠️ Requirements
+## Requirements
 
 - Python 3.10+
 - Websockets 12+
