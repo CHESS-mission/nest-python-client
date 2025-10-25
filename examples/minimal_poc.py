@@ -29,7 +29,7 @@ def main():
     print("Starting simulation...")
     client.start()
     try:
-        status = client.wait_for_status("running", timeout=5)
+        status = client.wait_for_status("running", timeout=10)
         print("Simulation started:", status)
     except Exception as e:
         print("⚠️ Warning:", e)

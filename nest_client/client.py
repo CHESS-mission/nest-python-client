@@ -362,10 +362,18 @@ class NestClient:
     # ------------------------------------------------------------------
     # Waiters (blocking)
     # ------------------------------------------------------------------
+
     def wait_for_status(self, state: str, timeout: Optional[float] = None) -> Dict[str, Any]:
         """Block until simulator reaches a given state (idle/ready/running)."""
         assert self._async_client is not None, "Client is not connected"
-        return self._run(self._async_client.wait_for_status(state, timeout))
+        try:
+            return self._run(self._async_client.wait_for_status(state, timeout))
+        except NestTimeoutError:
+            # Fallback: request latest known status
+            logger.warning(f"Timeout while waiting for status={state}. Fetching current state...")
+            last = self._run(self._async_client.wait_for_type("status", None, None, timeout=2))
+            logger.info(f"Last received status: {last}")
+            return last
 
     def wait_for_log(self, level: Optional[str] = None, timeout: Optional[float] = None) -> Dict[str, Any]:
         """Block until a log message arrives (optionally filtered by level)."""
