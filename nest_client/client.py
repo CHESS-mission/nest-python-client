@@ -62,12 +62,7 @@ if not logger.handlers:
 # Exceptions
 # ----------------------------------------------------------------------
 
-class NestError(Exception):
-    """Base exception for all client errors."""
-
-
-class NestTimeoutError(NestError):
-    """Raised when waiting for a message times out."""
+from .exceptions import NestError, NestTimeoutError
 
 # ----------------------------------------------------------------------
 # Asynchronous client (core implementation)
@@ -339,6 +334,17 @@ class NestClient:
         assert isinstance(yaml, str)    
         assert self._async_client is not None, "Client is not connected"
         self._run(self._async_client.upload_topology(yaml))
+    
+    def load_topology_from_file(self, path: str) -> None:
+        """
+        Load a topology YAML file from disk and upload it to the simulator.
+
+        Args:
+            path (str): Path to the YAML topology file.
+        """
+        with open(path, "r", encoding="utf-8") as f:
+            yaml_content = f.read()
+        self.upload_topology(yaml_content)
 
 
     def set_env(self, variable: str, value: Any) -> None:

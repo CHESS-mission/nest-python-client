@@ -1,6 +1,12 @@
 """
-NEST Python Client package.
+nest_client
+===========
 
-This package provides tools to connect to the NEST simulator via WebSocket,
-control simulations, send commands, and handle events or logs.
+Python client for the CHESS NEST simulator.
+Provides both synchronous and asynchronous APIs.
 """
+
+from .client import NestClient, AsyncNestClient
+from .exceptions import NestError, NestTimeoutError
+
+__all__ = ["NestClient", "AsyncNestClient", "NestError", "NestTimeoutError"]
