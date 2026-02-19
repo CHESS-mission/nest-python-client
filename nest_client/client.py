@@ -14,26 +14,29 @@ Client → Server (JSON messages):
     {"action": "stop"}
     {"action": "upload_topology", "topology_yaml": "<YAML string>"}
     {"action": "command", "component": "Computer A", "command": "pause", "arguments": {...}}
-    {"action": "set_env", "variable": "temp", "value": 23.2}
+    {"action": "set_env", "variable": "temp", "type": "float", "value": 23.2, "lerp_over_s": 5.0}
+        ... "type": "vec3",       "value": {"x": 1.0, "y": 2.0, "z": 3.0}
+        ... "type": "quaternion", "value": {"w": 1.0, "x": 0.0, "y": 0.0, "z": 0.0}
+        ... "type": "tensor",     "value": {"shape": [2, 5, 3], "data": [1.0, 2.0, ..., 29.0, 30.0]}
 
 Server → Client (JSON messages):
-    {"type": "status", "state": "running", "topology": {...}, "started_at": "2025-09-22T12:34:56Z"}
-    {"type": "event", "component": "...", "event": "...", "data": {...}}
-    {"type": "log", "timestamp": "...", "level": "...", "component": "...", "message": "..."}
-    {"type": "error", "message": "..."}
-
-References:
-- src/api/lib.rs for serialization rules (serde(tag="action"/"type"))
-- src/server/server.rs for WebSocket message dispatch
-- src/server/simulator.rs for state transitions (Idle → Ready → Running)
+    {"type": "status", "state": "running", "topology": {...}}
+    {"type": "event", "timestamp": 17.321, "component": "...", "event": "...", "data": {...}}
+    {"type": "log", "timestamp": 17.321, "level": "info", "component": "...", "message": "..."}
+    {"type": "error", "timestamp": 17.321, "component": "...", "message": "..."}
 """
 
 import asyncio
+from collections import defaultdict
 import json
 import logging
 import threading
 import time
-from typing import Any, Dict, Optional, Union
+from typing import Any, Awaitable, Callable, DefaultDict, Dict, Optional
+import numpy as np
+
+from nest_client.time import Time, s
+from nest_client.types import EnvVarType, EnvVarValueType
 
 from .config import DEFAULT_URL, DEFAULT_TIMEOUT
 
@@ -46,17 +49,8 @@ except ImportError:
     except ImportError:
         from websockets.legacy.client import connect, WebSocketClientProtocol as ClientConnection  # type: ignore[attr-defined]
 
-WebSocketClientProtocol = ClientConnection  # type: ignore[attr-defined]
-
-
 
 logger = logging.getLogger(__name__)
-if not logger.handlers:
-    handler = logging.StreamHandler()
-    formatter = logging.Formatter("[%(asctime)s] %(levelname)s: %(message)s", "%H:%M:%S")
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
 
 
 # ----------------------------------------------------------------------
@@ -74,13 +68,18 @@ class AsyncNestClient:
 
     def __init__(self, url: str = DEFAULT_URL, default_timeout: float = DEFAULT_TIMEOUT):
         self.url = url
-        self.ws: Optional[WebSocketClientProtocol] = None
+        self.ws: Optional[ClientConnection] = None
         self._recv_task: Optional[asyncio.Task] = None
         self._default_timeout = default_timeout
         self._send_lock = asyncio.Lock()
 
         self._msg_queue: asyncio.Queue = asyncio.Queue()
         self._connected = asyncio.Event()
+
+        self._listeners: DefaultDict[
+            Optional[str], list[Callable[[Dict[str, Any]], Awaitable[None] | None]]
+        ] = defaultdict(list)
+        self._listener_lock = asyncio.Lock()
 
     # ------------------------------------------------------------------
     # Connection management
@@ -116,6 +115,57 @@ class AsyncNestClient:
         logger.info("Disconnected.")
 
     # ------------------------------------------------------------------
+    # Dispatcher / Listener API
+    # ------------------------------------------------------------------
+    async def add_listener(
+        self,
+        callback: Callable[[Dict[str, Any]], Awaitable[None] | None],
+        message_type: Optional[str] = None,
+    ) -> None:
+        """
+        Register a callback for a specific message type.
+
+        Args:
+            callback: Function or coroutine receiving the message dict.
+            message_type:
+                - "event", "log", "status", "error"
+                - None = receive ALL messages
+        """
+        async with self._listener_lock:
+            self._listeners[message_type].append(callback)
+
+
+    async def remove_listener(
+        self,
+        callback: Callable[[Dict[str, Any]], Awaitable[None] | None],
+        message_type: Optional[str] = None,
+    ) -> None:
+        """Unregister a previously added listener."""
+        async with self._listener_lock:
+            if callback in self._listeners[message_type]:
+                self._listeners[message_type].remove(callback)
+
+
+    async def _dispatch(self, msg: Dict[str, Any]) -> None:
+        """Dispatch message to registered listeners."""
+        async with self._listener_lock:
+            # Specific listeners
+            specific = list(self._listeners.get(msg.get("type"), []))
+            # Global listeners
+            global_listeners = list(self._listeners.get(None, []))
+
+        for callback in specific + global_listeners:
+            try:
+                if asyncio.iscoroutinefunction(callback):
+                    asyncio.create_task(callback(msg))
+                else:
+                    result = callback(msg)
+                    if asyncio.iscoroutine(result):
+                        asyncio.create_task(result)
+            except Exception:
+                logger.exception("Listener raised exception")
+
+    # ------------------------------------------------------------------
     # Sending actions (client → server)
     # ------------------------------------------------------------------
     async def _send(self, payload: Dict[str, Any]) -> None:
@@ -148,8 +198,75 @@ class AsyncNestClient:
     async def upload_topology(self, topology_yaml: str) -> None:
         await self._send({"action": "upload_topology", "topology_yaml": topology_yaml})
 
-    async def set_env(self, variable: str, value: Any) -> None:
-        await self._send({"action": "set_env", "variable": variable, "value": value})
+    async def set_env(
+        self,
+        variable: str,
+        type: EnvVarType,
+        value: EnvVarValueType,
+        lerp_over_s: Time | None = None,
+    ) -> None:
+        def serialize_value() -> object:
+            match type:
+                case EnvVarType.INT:
+                    if not isinstance(value, int):
+                        raise TypeError("INT env var requires int value")
+                    return value
+
+                case EnvVarType.FLOAT:
+                    if not isinstance(value, (int, float)):
+                        raise TypeError("FLOAT env var requires float value")
+                    return float(value)
+
+                case EnvVarType.BOOL:
+                    if not isinstance(value, bool):
+                        raise TypeError("BOOL env var requires bool value")
+                    return value
+
+                case EnvVarType.VEC2:
+                    arr = np.asarray(value, dtype=float)
+                    if arr.shape != (2,):
+                        raise ValueError("VEC2 requires shape (2,)")
+                    return {"x": float(arr[0]), "y": float(arr[1])}
+
+                case EnvVarType.VEC3:
+                    arr = np.asarray(value, dtype=float)
+                    if arr.shape != (3,):
+                        raise ValueError("VEC3 requires shape (3,)")
+                    return {
+                        "x": float(arr[0]),
+                        "y": float(arr[1]),
+                        "z": float(arr[2]),
+                    }
+
+                case EnvVarType.QUATERNION:
+                    arr = np.asarray(value, dtype=float)
+                    if arr.shape != (4,):
+                        raise ValueError("QUATERNION requires shape (4,) ordered (w,x,y,z)")
+                    return {
+                        "w": float(arr[0]),
+                        "x": float(arr[1]),
+                        "y": float(arr[2]),
+                        "z": float(arr[3]),
+                    }
+
+                case EnvVarType.TENSOR:
+                    arr = np.asarray(value, dtype=float)
+                    return {
+                        "shape": list(arr.shape),
+                        "data": arr.flatten().tolist(),
+                    }
+
+        payload = {
+            "action": "set_env",
+            "variable": variable,
+            "type": type.name.lower(),
+            "value": serialize_value(),
+        }
+
+        if lerp_over_s is not None:
+            payload["lerp_over_s"] = lerp_over_s.as_unit(s)
+
+        await self._send(payload)
 
     async def send_command(
         self, component: str, command: str, arguments: Optional[Dict[str, Any]] = None
@@ -173,7 +290,9 @@ class AsyncNestClient:
                     logger.warning("Non-JSON message: %s", raw)
                     continue
                 await self._msg_queue.put(msg)
+                await self._dispatch(msg)
                 logger.debug("Received: %s", msg)
+
         except asyncio.CancelledError:
             pass
         except Exception as e:
@@ -347,10 +466,16 @@ class NestClient:
         self.upload_topology(yaml_content)
 
 
-    def set_env(self, variable: str, value: Any) -> None:
+    def set_env(
+        self,
+        variable: str,
+        type: EnvVarType,
+        value: EnvVarValueType,
+        lerp_over_s: Time | None = None,
+    ) -> None:
         """Set an environment variable in the simulator."""
         assert self._async_client is not None, "Client is not connected"
-        self._run(self._async_client.set_env(variable, value))
+        self._run(self._async_client.set_env(variable, type, value, lerp_over_s))
 
     def send_command(
         self, component: str, command: str, arguments: Optional[Dict[str, Any]] = None
