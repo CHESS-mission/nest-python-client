@@ -1,84 +1,46 @@
-# 🛰️ NEST Python Client
+# NEST Client
 
-A Python interface for the **CHESS NEST simulator**, allowing users to interact with the simulator through WebSocket instead of Rust or the web frontend.
+A Python client for [NEST](https://github.com/CHESS-mission/nest).
 
-This client can:
+Features:
+
 - Connect to the running NEST simulator
 - Upload topologies (YAML files)
 - Start and stop simulations
 - Receive real-time logs, status updates, and events
-
+- Execute test scenarios
 
 ## Installation
 
-1. Clone the repository:
-```
-git clone https://github.com/CHESS-mission/nest-python-client.git
-cd nest-python-client
-```
+You can install the client locally with pip:
 
-2. (Recommended) Create and activate a virtual environment:
-```
-python3 -m venv venv
-source venv/bin/activate
+```bash
+pip install -e .
 ```
 
-3. Install dependencies:
-```
-pip install -r requirements.txt
-```
+## Usage
 
----
+The client ships with an interactive shell that can be invoked using
+`nest-client` with no positional aguments.
 
-## Running the NEST simulator
-
-Before running the Python client, start the simulator from the main NEST repository:
-
-```
-cd ../nest
-cargo run
+```bash
+nest-client
 ```
 
-You should see:
-```
-listening on http://127.0.0.1:3000
-```
+To list available scenarios in a python module, use `list`.
 
-
-## Basic usage
-
-```
-from nest_client import NestClient
-
-client = NestClient()  # Defaults to ws://localhost:3000/ws
-
-client.connect()
-client.load_topology_from_file("examples/topology_example.yaml")
-client.start()
-
-status = client.wait_for_status("running", timeout=10)
-print(status)
-
-client.stop()
-client.disconnect()
+```bash
+nest-client list scenarios
 ```
 
-## Example scripts
+To display the timeline of a specific scenario, use `show`.
 
-You can run included examples directly:
-```
-python examples/minimal_poc.py
-```
-
-Or use the helper script:
-```
-bash scripts/run_poc.sh
+```bash
+nest-client show scenarios.sensors.sensors
 ```
 
+Finally, use `run` to execute a scenario.
 
-## Requirements
-
-- Python 3.10+
-- Websockets 12+
-- A running instance of the NEST simulator (`cargo run` from the main repo)
-
+```bash
+nest-client run scenarios.sensors.sensors
+```
