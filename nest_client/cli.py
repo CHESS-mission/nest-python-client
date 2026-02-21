@@ -118,7 +118,7 @@ def print_validation_report(scenario: Scenario, results: List[ValidationResult])
             expect = "EXPECT" if event.expect else "FORBID"
             symbol = green('OK') if result.success else red('FAILED')
             window_start = result.op.offset.as_unit(s)
-            window_end = window_start + (event.within if event.within else scope.end).as_unit(s)
+            window_end = (result.op.offset + event.within if event.within else scope.end).as_unit(s)
             event_window = f"[{window_start}s -> {window_end}s]"
 
             print(f"  [{symbol}] {expect} {event.component}.{event.name} {event_window}")

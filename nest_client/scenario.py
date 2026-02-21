@@ -183,8 +183,14 @@ class Scenario:
                     e.get("component") == event.component
                     and e.get("event") == event.name
                 ):
-                    if event.predicate and not event.predicate(e.get("data")):
-                        continue
+                    if event.predicate:
+                        try:
+                            if not event.predicate(e.get("data")):
+                                continue
+                        # Be permissive about KeyError to make predicates more ergonomic
+                        # (i.e. predicate fails if key does not exist)
+                        except KeyError:
+                            continue
 
                     ts = e.get("timestamp", 0)
                     if window_start <= ts <= window_end:

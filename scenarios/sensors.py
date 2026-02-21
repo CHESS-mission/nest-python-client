@@ -22,6 +22,11 @@ def sensors():
     with timeline() as t:
         t[0 * s] = env_ramp()
 
+        t[3 * s] = command("QEMU", "qmp_command", { "execute": "query-status" })
+        t[3 * s] = event("QEMU", "qmp_response") \
+            .where(lambda data: data['running'] == True and data['status'] == 'running') \
+            .expect(within=500 * ms)
+
         with t.offset(30*s, "defect_loop"):
             for i in range(10):
                 t[60 * i * s] = command("MMC5983MA", "simulate_defect", True)
