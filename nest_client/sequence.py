@@ -117,7 +117,7 @@ class SequenceOp:
     scope_stack: List[Scope]
 
     def __repr__(self) -> str:
-        scope = " / ".join([s.label or '<anonymous>' for s in self.scope_stack if s.label])
+        scope = " / ".join([s.label for s in self.scope_stack if s.label])
         return f"[{str(self.offset):>8}] ({scope}) {self.item}"
 
 

@@ -171,8 +171,8 @@ class Scenario:
 
             event = op.item
             window_start = op.offset.as_unit(s)
-            window_end = window_start + (
-                event.within if event.within else op.scope_stack[-1].end # Parent scope
+            window_end = (
+                op.offset + event.within if event.within else op.scope_stack[-1].end # Parent scope
             ).as_unit(s)
 
             matched = False
@@ -185,7 +185,8 @@ class Scenario:
                 ):
                     if event.predicate:
                         try:
-                            if not event.predicate(e.get("data")):
+                            data = e.get("data")
+                            if data is None or not event.predicate(data):
                                 continue
                         # Be permissive about KeyError to make predicates more ergonomic
                         # (i.e. predicate fails if key does not exist)

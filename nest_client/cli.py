@@ -95,7 +95,7 @@ def print_validation_report(scenario: Scenario, results: List[ValidationResult])
     scope_groups = DefaultDict(list)
     
     for result in results:
-        path = tuple(scope.label for scope in result.op.scope_stack)
+        path = tuple(scope.label or '' for scope in result.op.scope_stack)
         scope_groups[path].append(result)
     
     sorted_paths = sorted(scope_groups.keys())
@@ -103,7 +103,7 @@ def print_validation_report(scenario: Scenario, results: List[ValidationResult])
     for path in sorted_paths:
         scope_results = scope_groups[path]
         scope = scope_results[0].op.scope_stack[-1]
-        path_string = " / ".join([label or '<anonymous>' for label in path])
+        path_string = " / ".join([label for label in path if label != ''])
 
         print("─" * REPORT_WIDTH)
         scope_window = f"[{scope.start.as_unit(s)}s -> {scope.end.as_unit(s)}s]"
@@ -263,6 +263,7 @@ def list_scenarios(args):
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="nest-client")
     parser.add_argument("--verbose", "-v", action="store_true")
+    parser.add_argument("--debug", action="store_true")
     parser.add_argument("--url", help=f"Websocket URL [default={DEFAULT_URL}]", default=DEFAULT_URL)
 
     subparsers = parser.add_subparsers(dest="command")
@@ -320,7 +321,10 @@ def main():
 
     except Exception as e:
         # Unexpected error
-        print("Unexpected error occurred.", file=sys.stderr)
-        print(f"{type(e).__name__}: {e}", file=sys.stderr)
-        sys.exit(1)
+        if args.debug:
+            raise  # full traceback
+        else:
+            print("Unexpected error occurred.", file=sys.stderr)
+            print(f"{type(e).__name__}: {e}", file=sys.stderr)
+            sys.exit(1)
 
