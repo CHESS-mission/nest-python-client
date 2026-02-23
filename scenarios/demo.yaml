@@ -1,0 +1,384 @@
+environment_variables:
+  - name: temp
+    type: float
+  - name: accel
+    type: vec3
+  - name: omega
+    type: vec3
+  - name: B_field
+    type: vec3
+
+
+components:
+
+  # -------------------
+  # Virtual machines
+  # -------------------
+
+  - name: CPU_A
+    type: qemu
+    config:
+      arch: arm
+      mem_mb: 1024
+      options: 
+        - option: cpu
+          value: cortex-a7
+        - option: M
+          value: virt
+        - option: kernel
+          value: ./image-demo-CPU_A/zImage 
+        - option: append
+          value: rootwait root=/dev/vda console=hvc0
+        - option: drive
+          value: if=none,file=./image-demo-CPU_A/disk.qcow2,id=hd0 
+        - option: device
+          value: virtio-blk-device,drive=hd0 
+        - option: nographic 
+
+        # Use virtual console to leave UART ports available
+        - option: device
+          value: virtio-serial
+        - option: chardev
+          value: pty,path=/tmp/qemu-serial-pty-CPU_A,id=char0
+        - option: device
+          value: virtconsole,chardev=char0
+      i2c_timeout_ms: 10
+      nuart: 1
+      ngpio: 32
+    ports:
+      system:
+        - name: uart0
+          type: bytes
+        - name: gpio13
+          type: bool
+        - name: i2c
+          type: i2c
+
+  - name: CPU_B
+    type: qemu
+    config:
+      arch: arm
+      mem_mb: 1024
+      options: 
+        - option: cpu
+          value: cortex-a7
+        - option: M
+          value: virt
+        - option: kernel
+          value: ./image-demo-CPU_B/zImage 
+        - option: append
+          value: rootwait root=/dev/vda console=hvc0
+        - option: drive
+          value: if=none,file=./image-demo-CPU_B/disk.qcow2,id=hd0 
+        - option: device
+          value: virtio-blk-device,drive=hd0 
+        - option: nographic 
+
+        # Use virtual console to leave UART ports available
+        - option: device
+          value: virtio-serial
+        - option: chardev
+          value: pty,path=/tmp/qemu-serial-pty-CPU_B,id=char0
+        - option: device
+          value: virtconsole,chardev=char0
+      i2c_timeout_ms: 10
+      nuart: 1
+      ngpio: 32
+    ports:
+      system:
+        - name: uart0
+          type: bytes
+        - name: i2c
+          type: i2c
+
+  # -------------------
+  # M4 microcontroller
+  # -------------------
+
+  - name: M4
+    type: wasm
+    config:
+      module: component_artifacts/m4.wasm
+      options:
+        - ["heartbeat_timeout", "20"]
+    ports:
+      system:
+        - name: heartbeat
+          type: bool
+        - name: select
+          type: bool
+
+  # -------------------
+  # Multiplexer
+  # -------------------
+
+  - name: Mux
+    type: mux
+    config:
+      multiplexed_ports:
+        - common: uart
+          channels:
+            - uartA
+            - uartB
+        - common: i2c
+          channels:
+            - i2cA
+            - i2cB
+    ports:
+      system:
+        - name: select
+          type: bool
+
+        - name: uart
+          type: bytes
+        - name: uartA
+          type: bytes
+        - name: uartB
+          type: bytes
+
+        - name: i2c
+          type: i2c
+        - name: i2cA
+          type: i2c
+        - name: i2cB
+          type: i2c
+
+  # -------------------
+  # Transceiver
+  # -------------------
+
+  - name: Transceiver
+    type: wasm
+    config:
+      module: component_artifacts/transceiver.wasm
+    ports:
+      system:
+        - name: uart
+          type: bytes
+
+  # -------------------
+  # Temperature sensors
+  # -------------------
+
+  - name: PCT2075_0
+    type: wasm
+    config:
+      module: component_artifacts/pct2075tp147.wasm
+      options:
+        - ["i2cAddress", "0x48"]
+    ports:
+      system:
+        - name: i2c
+          type: i2c
+      environment:
+        - name: temperature
+          variable: temp
+          type: float
+
+  - name: PCT2075_1
+    type: wasm
+    config:
+      module: component_artifacts/pct2075tp147.wasm
+      options:
+        - ["i2cAddress", "0x49"]
+    ports:
+      system:
+        - name: i2c
+          type: i2c
+      environment:
+        - name: temperature
+          variable: temp
+          type: float
+
+  - name: PCT2075_2
+    type: wasm
+    config:
+      module: component_artifacts/pct2075tp147.wasm
+      options:
+        - ["i2cAddress", "0x4A"]
+    ports:
+      system:
+        - name: i2c
+          type: i2c
+      environment:
+        - name: temperature
+          variable: temp
+          type: float
+
+  - name: PCT2075_3
+    type: wasm
+    config:
+      module: component_artifacts/pct2075tp147.wasm
+      options:
+        - ["i2cAddress", "0x4B"]
+    ports:
+      system:
+        - name: i2c
+          type: i2c
+      environment:
+        - name: temperature
+          variable: temp
+          type: float
+
+  - name: PCT2075_4
+    type: wasm
+    config:
+      module: component_artifacts/pct2075tp147.wasm
+      options:
+        - ["i2cAddress", "0x4C"]
+    ports:
+      system:
+        - name: i2c
+          type: i2c
+      environment:
+        - name: temperature
+          variable: temp
+          type: float
+
+  - name: PCT2075_5
+    type: wasm
+    config:
+      module: component_artifacts/pct2075tp147.wasm
+      options:
+        - ["i2cAddress", "0x4D"]
+    ports:
+      system:
+        - name: i2c
+          type: i2c
+      environment:
+        - name: temperature
+          variable: temp
+          type: float
+
+  - name: PCT2075_6
+    type: wasm
+    config:
+      module: component_artifacts/pct2075tp147.wasm
+      options:
+        - ["i2cAddress", "0x4E"]
+    ports:
+      system:
+        - name: i2c
+          type: i2c
+      environment:
+        - name: temperature
+          variable: temp
+          type: float
+
+  - name: PCT2075_7
+    type: wasm
+    config:
+      module: component_artifacts/pct2075tp147.wasm
+      options:
+        - ["i2cAddress", "0x4F"]
+    ports:
+      system:
+        - name: i2c
+          type: i2c
+      environment:
+        - name: temperature
+          variable: temp
+          type: float
+
+  # -------------------
+  # IMU & Mag sensors
+  # -------------------
+
+  - name: IIM-42652
+    type: wasm
+    config:
+      module: component_artifacts/iim42652.wasm
+      options:
+        - ["i2cAddress", "0x68"]
+    ports:
+      system:
+        - name: i2c
+          type: i2c
+      environment:
+        - name: acceleration
+          variable: accel
+          type: vec3
+        - name: angular-velocity
+          variable: omega
+          type: vec3
+
+  - name: MMC5983MA
+    type: wasm
+    config:
+      module: component_artifacts/mmc5983ma.wasm
+    ports:
+      system:
+        - name: i2c
+          type: i2c
+      environment:
+        - name: mag-field
+          variable: B_field
+          type: vec3
+
+wires:
+  - # Heartbeat line
+    - component: CPU_A
+      port: gpio13
+    - component: M4
+      port: heartbeat
+
+  - # Select line
+    - component: M4
+      port: select
+    - component: Mux
+      port: select
+
+  - # CPU_A UART
+    - component: CPU_A
+      port: uart0
+    - component: Mux
+      port: uartA
+
+  - # CPU_B UART
+    - component: CPU_B
+      port: uart0
+    - component: Mux
+      port: uartB
+
+  - # Mux UART
+    - component: Mux
+      port: uart
+    - component: Transceiver
+      port: uart
+
+  - # CPU_A I2C bus
+    - component: CPU_A
+      port: i2c
+    - component: Mux
+      port: i2cA
+
+  - # CPU_B I2C bus
+    - component: CPU_B
+      port: i2c
+    - component: Mux
+      port: i2cB
+
+  - # Mux I2C bus
+    - component: Mux
+      port: i2c
+    - component: PCT2075_0
+      port: i2c
+    - component: PCT2075_1
+      port: i2c
+    - component: PCT2075_2
+      port: i2c
+    - component: PCT2075_3
+      port: i2c
+    - component: PCT2075_4
+      port: i2c
+    - component: PCT2075_5
+      port: i2c
+    - component: PCT2075_6
+      port: i2c
+    - component: PCT2075_7
+      port: i2c
+    - component: IIM-42652
+      port: i2c
+    - component: MMC5983MA
+      port: i2c
+
