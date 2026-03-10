@@ -151,10 +151,14 @@ components:
     config:
       fuzzed_ports:
         - name: uart
-          syst_side:
-            - uart_syst
-          comp_side:
-            - uart_comp
+          syst_side: uart_syst
+          comp_side: uart_comp
+          comp_to_syst:
+            enabled: false
+            drop_prob: 1.0
+          syst_to_comp: 
+            enabled: false
+            drop_prob: 1.0
     ports:
       system:
         - name: uart_syst
