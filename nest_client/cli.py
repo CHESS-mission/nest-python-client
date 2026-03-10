@@ -320,6 +320,12 @@ def main():
         sys.exit(130)
 
     except Exception as e:
+        from nest_client.exceptions import NestError
+        if isinstance(e, NestError):
+            # WS drop mid-scenario (NEST server restart, QEMU crash, etc.)
+            print(f"\nNEST connection lost: {e}", file=sys.stderr)
+            print("The NEST server may have crashed or restarted. Check nest_server.log.", file=sys.stderr)
+            sys.exit(1)
         # Unexpected error
         if args.debug:
             raise  # full traceback
