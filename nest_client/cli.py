@@ -1,6 +1,9 @@
 import argparse
 import importlib
-import pkgutil
+import importlib.util
+from pathlib import Path
+from types import ModuleType
+import hashlib
 import sys
 import logging
 from typing import DefaultDict, List
@@ -40,47 +43,70 @@ class Color:
 def green(text): return f"{Color.GREEN}{text}{Color.RESET}"
 def red(text): return f"{Color.RED}{text}{Color.RESET}"
 
-def load_scenario(dotted_path: str) -> Scenario:
+
+_loaded_modules: dict[Path, ModuleType] = {}
+
+
+def load_module_from_path(file_path: Path) -> ModuleType:
+    file_path = file_path.resolve()
+
+    if file_path in _loaded_modules:
+        return _loaded_modules[file_path]
+
+    # Stable unique name
+    module_name = "_scenario_" + hashlib.md5(
+        str(file_path).encode()
+    ).hexdigest()
+
+    spec = importlib.util.spec_from_file_location(module_name, file_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load module from {file_path}")
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+
+    _loaded_modules[file_path] = module
+    return module
+
+
+def load_scenario(path_spec: str) -> Scenario:
     """
-    Load scenario from dotted path
+    Load scenario from "path/to/file.py:scenario_name"
     """
     try:
-        module_path, scenario_name = dotted_path.rsplit(".", 1)
+        file_part, scenario_name = path_spec.split(":")
     except ValueError:
         raise ValueError(
-            "Scenario must be specified as module.function "
-            "(e.g. scenarios.temperature.raise_temperature)"
+            "Scenario must be specified as path/to/file.py:scenario_name"
         )
 
-    module = importlib.import_module(module_path)
-    obj = getattr(module, scenario_name)
+    file_path = Path(file_part).resolve()
+
+    module = load_module_from_path(file_path)
+
+    obj = getattr(module, scenario_name, None)
 
     if not isinstance(obj, Scenario):
-        raise ValueError("Target is not a scenario.")
+        raise ValueError(f"{scenario_name} is not a Scenario in {file_part}")
 
     return obj
 
 
-def discover_scenarios(package_name: str):
+def discover_scenarios(dir_path: str):
     """
-    Recursively discover @scenario functions inside a package.
+    Recursively discover @scenario functions inside a folder.
     """
-    package = importlib.import_module(package_name)
     results = []
+    path = Path(dir_path)
 
-    for _, modname, ispkg in pkgutil.walk_packages(
-        package.__path__,
-        package.__name__ + "."
-    ):
-        if ispkg:
-            continue
-
-        module = importlib.import_module(modname)
+    for file in path.glob("*.py"):
+        module = load_module_from_path(file)
 
         for attr in dir(module):
             obj = getattr(module, attr)
             if isinstance(obj, Scenario):
-                results.append(f"{modname}.{attr}")
+                results.append(f"{file.as_posix()}:{attr}")
 
     return sorted(results)
 
