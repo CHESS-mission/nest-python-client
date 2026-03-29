@@ -5,6 +5,7 @@ from pathlib import Path
 from types import ModuleType
 import hashlib
 import sys
+import ast
 import logging
 from typing import DefaultDict, List
 
@@ -70,6 +71,33 @@ def load_module_from_path(file_path: Path) -> ModuleType:
     return module
 
 
+def file_has_scenario_decorator(file_path: Path) -> bool:
+    """
+    Quickly check if a .py file uses @scenario without executing it.
+    """
+    try:
+        tree = ast.parse(file_path.read_text(encoding="utf-8"))
+    except SyntaxError:
+        return False
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for decorator in node.decorator_list:
+            # Matches @scenario(...) 
+            if isinstance(decorator, ast.Call):
+                func = decorator.func
+                name = func.id if isinstance(func, ast.Name) else (
+                    func.attr if isinstance(func, ast.Attribute) else None
+                )
+                if name == "scenario":
+                    return True
+            # Matches bare @scenario (no-arg form)
+            elif isinstance(decorator, ast.Name) and decorator.id == "scenario":
+                return True
+    return False
+
+
 def load_scenario(path_spec: str) -> Scenario:
     """
     Load scenario from "path/to/file.py:scenario_name"
@@ -100,8 +128,17 @@ def discover_scenarios(dir_path: str):
     results = []
     path = Path(dir_path)
 
-    for file in path.glob("*.py"):
-        module = load_module_from_path(file)
+    for file in path.rglob("*.py"):
+        if "__pycache__" in file.parts:
+            continue
+
+        if not file_has_scenario_decorator(file):
+            continue
+
+        try:
+            module = load_module_from_path(file)
+        except Exception as _:
+            continue
 
         for attr in dir(module):
             obj = getattr(module, attr)
