@@ -3,7 +3,7 @@ import asyncio
 from dataclasses import dataclass
 import json
 import logging
-import sys
+import inspect
 import time
 from pathlib import Path
 from typing import Callable, Dict, List
@@ -214,10 +214,13 @@ class Scenario:
 
 def scenario(topology_file: str):
     def decorator(fn: Callable[[], None]) -> Scenario:
-        # Resolve module file path
-        module = sys.modules[fn.__module__]
-        assert module.__file__ is not None
-        module_file = Path(module.__file__).resolve()
+        # Resolve scenario file path
+        module_file = inspect.getsourcefile(fn)
+        if module_file is None:
+            raise RuntimeError(f"Cannot determine source file for {fn}")
+
+        module_file = Path(module_file).resolve()
+        module_dir = module_file.parent
         module_dir = module_file.parent
 
         # Resolve topology relative to module
