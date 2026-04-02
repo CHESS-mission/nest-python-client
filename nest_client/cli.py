@@ -1,7 +1,11 @@
 import argparse
 import importlib
-import pkgutil
+import importlib.util
+from pathlib import Path
+from types import ModuleType
+import hashlib
 import sys
+import ast
 import logging
 from typing import DefaultDict, List
 
@@ -40,47 +44,106 @@ class Color:
 def green(text): return f"{Color.GREEN}{text}{Color.RESET}"
 def red(text): return f"{Color.RED}{text}{Color.RESET}"
 
-def load_scenario(dotted_path: str) -> Scenario:
+
+_loaded_modules: dict[Path, ModuleType] = {}
+
+
+def load_module_from_path(file_path: Path) -> ModuleType:
+    file_path = file_path.resolve()
+
+    if file_path in _loaded_modules:
+        return _loaded_modules[file_path]
+
+    # Stable unique name
+    module_name = "_scenario_" + hashlib.md5(
+        str(file_path).encode()
+    ).hexdigest()
+
+    spec = importlib.util.spec_from_file_location(module_name, file_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load module from {file_path}")
+
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+
+    _loaded_modules[file_path] = module
+    return module
+
+
+def file_has_scenario_decorator(file_path: Path) -> bool:
     """
-    Load scenario from dotted path
+    Quickly check if a .py file uses @scenario without executing it.
     """
     try:
-        module_path, scenario_name = dotted_path.rsplit(".", 1)
+        tree = ast.parse(file_path.read_text(encoding="utf-8"))
+    except SyntaxError:
+        return False
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for decorator in node.decorator_list:
+            # Matches @scenario(...) 
+            if isinstance(decorator, ast.Call):
+                func = decorator.func
+                name = func.id if isinstance(func, ast.Name) else (
+                    func.attr if isinstance(func, ast.Attribute) else None
+                )
+                if name == "scenario":
+                    return True
+            # Matches bare @scenario (no-arg form)
+            elif isinstance(decorator, ast.Name) and decorator.id == "scenario":
+                return True
+    return False
+
+
+def load_scenario(path_spec: str) -> Scenario:
+    """
+    Load scenario from "path/to/file.py:scenario_name"
+    """
+    try:
+        file_part, scenario_name = path_spec.split(":")
     except ValueError:
         raise ValueError(
-            "Scenario must be specified as module.function "
-            "(e.g. scenarios.temperature.raise_temperature)"
+            "Scenario must be specified as path/to/file.py:scenario_name"
         )
 
-    module = importlib.import_module(module_path)
-    obj = getattr(module, scenario_name)
+    file_path = Path(file_part).resolve()
+
+    module = load_module_from_path(file_path)
+
+    obj = getattr(module, scenario_name, None)
 
     if not isinstance(obj, Scenario):
-        raise ValueError("Target is not a scenario.")
+        raise ValueError(f"{scenario_name} is not a Scenario in {file_part}")
 
     return obj
 
 
-def discover_scenarios(package_name: str):
+def discover_scenarios(dir_path: str):
     """
-    Recursively discover @scenario functions inside a package.
+    Recursively discover @scenario functions inside a folder.
     """
-    package = importlib.import_module(package_name)
     results = []
+    path = Path(dir_path)
 
-    for _, modname, ispkg in pkgutil.walk_packages(
-        package.__path__,
-        package.__name__ + "."
-    ):
-        if ispkg:
+    for file in path.rglob("*.py"):
+        if "__pycache__" in file.parts:
             continue
 
-        module = importlib.import_module(modname)
+        if not file_has_scenario_decorator(file):
+            continue
+
+        try:
+            module = load_module_from_path(file)
+        except Exception as _:
+            continue
 
         for attr in dir(module):
             obj = getattr(module, attr)
             if isinstance(obj, Scenario):
-                results.append(f"{modname}.{attr}")
+                results.append(f"{file.as_posix()}:{attr}")
 
     return sorted(results)
 
