@@ -18,6 +18,7 @@ from .scenario import scenario
 from .sequence import sequence, timeline, command, event, set_env
 from .types import EnvVarType
 from .time import s, ms, us
+from .mutator import TopologyMutator
 
 # Version
 from .__version__ import __version__
@@ -40,6 +41,7 @@ __all__ = [
     "s",
     "ms",
     "us",
+    "TopologyMutator",
 
     # Metadata
     "__version__",
