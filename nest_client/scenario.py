@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Callable, Dict, List
 
 from nest_client.client import AsyncNestClient
+from nest_client.mutator import TopologyMutator
 from nest_client.sequence import Command, Event, Sequence, SequenceOp, SetEnv
 from nest_client.time import Time, s
 #from nest_client.fuzz_oracle import FuzzOracle, FuzzResult
@@ -31,10 +32,18 @@ class Scenario:
         name: str,
         topology_file: Path,
         sequence: Sequence,
+        mutate_topology: bool = False,
+        persist_mutated_topology: bool = False,
+        mutation_seed: int = 0,
+        mutation_output_dir: Path | None = None,
     ):
         self.name = name
         self.topology_file = topology_file
         self.sequence = sequence
+        self.mutate_topology = mutate_topology
+        self.persist_mutated_topology = persist_mutated_topology
+        self.mutation_seed = mutation_seed
+        self.mutation_output_dir = mutation_output_dir
 
         self._events: List[dict] = []
         self._errors: List[dict] = []
@@ -78,9 +87,7 @@ class Scenario:
         # Register listeners
         await client.add_listener(self._on_message)
 
-        # Upload topology
-        with open(self.topology_file, "r", encoding="utf-8") as f:
-            topology = f.read()
+        topology = self._build_topology_yaml()
 
         await client.upload_topology(topology)
         await client.start()
@@ -89,6 +96,26 @@ class Scenario:
         await client.wait_for_status("running")
 
         self._start_time = time.monotonic()
+
+    def _build_topology_yaml(self) -> str:
+        with open(self.topology_file, "r", encoding="utf-8") as f:
+            seed_yaml = f.read()
+
+        if not self.mutate_topology:
+            return seed_yaml
+
+        mutator = TopologyMutator(base_seed=self.mutation_seed)
+        mutated = mutator.mutate_file(self.topology_file)
+
+        if self.persist_mutated_topology:
+            output_dir = self.mutation_output_dir or self.topology_file.parent / "mutations"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = int(time.time())
+            output_path = output_dir / f"{self.topology_file.stem}.mutated.{timestamp}.yaml"
+            mutator.save_topology(mutated, output_path)
+            logger.info("Saved mutated topology to %s", output_path)
+
+        return mutator.dump_yaml(mutated)
 
     async def _end_simulation(self, client: AsyncNestClient):
         # stop() is best-effort: the server may have already closed the connection
@@ -252,7 +279,14 @@ class Scenario:
 # Scenario decorator
 # ------------------------------------------------------------------
 
-def scenario(topology_file: str):
+def scenario(
+    topology_file: str,
+    *,
+    mutate_topology: bool = False,
+    persist_mutated_topology: bool = False,
+    mutation_seed: int = 0,
+    mutation_output_dir: str | None = None,
+):
     def decorator(fn: Callable[[], None]) -> Scenario:
         # Resolve module file path
         module = sys.modules[fn.__module__]
@@ -267,6 +301,10 @@ def scenario(topology_file: str):
             raise FileNotFoundError(
                 f"Topology file not found: {resolved_topology}"
             )
+
+        resolved_output_dir = None
+        if mutation_output_dir is not None:
+            resolved_output_dir = (module_dir / mutation_output_dir).resolve()
 
         def build_sequence() -> Sequence:
             from nest_client.sequence import Sequence, _timeline_stack
@@ -286,6 +324,10 @@ def scenario(topology_file: str):
             name=fn.__name__,
             topology_file=resolved_topology,
             sequence=build_sequence(),
+            mutate_topology=mutate_topology,
+            persist_mutated_topology=persist_mutated_topology,
+            mutation_seed=mutation_seed,
+            mutation_output_dir=resolved_output_dir,
         )
 
         return scen

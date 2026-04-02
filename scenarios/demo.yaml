@@ -144,26 +144,6 @@ components:
           type: i2c
 
   # -------------------
-  # Fuzzer
-  # -------------------
-  - name: Fuzzer
-    type: fuzzer
-    config:
-      fuzzed_ports:
-        - name: uart
-          syst_side:
-            - uart_syst
-          comp_side:
-            - uart_comp
-    ports:
-      system:
-        - name: uart_syst
-          type: bytes
-        - name: uart_comp
-          type: bytes
-
-
-  # -------------------
   # Transceiver
   # -------------------
 
@@ -360,15 +340,9 @@ wires:
     - component: Mux
       port: uartB
 
-  - # Mux Fuzzer
+  - # Mux Transceiver
     - component: Mux
       port: uart
-    - component: Fuzzer
-      port: uart_syst
-  
-  - # Fuzzer Transceiver
-    - component: Fuzzer
-      port: uart_comp
     - component: Transceiver
       port: uart
 
