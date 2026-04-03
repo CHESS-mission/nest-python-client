@@ -17,7 +17,7 @@ from .exceptions import NestError, NestTimeoutError
 from .scenario import scenario
 from .sequence import sequence, timeline, command, event, set_env
 from .types import EnvVarType
-from .time import s, ms, us
+from .time import m, s, ms, us
 
 # Version
 from .__version__ import __version__
@@ -37,6 +37,7 @@ __all__ = [
     "event",
     "set_env",
     "EnvVarType",
+    "m",
     "s",
     "ms",
     "us",
