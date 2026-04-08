@@ -144,54 +144,6 @@ components:
           type: i2c
 
   # -------------------
-  # Fuzzer
-  # -------------------
-  - name: Fuzzer
-    type: fuzzer
-    config:
-      fuzzed_ports:
-        - name: uart
-          syst_side: uart_syst
-          comp_side: uart_comp
-          seed: 42
-
-          comp_to_syst:
-            enabled: true
-            strategies:
-              - type: drop
-                drop_prob: 0.05
-
-              - type: bitflip
-                flip_prob: 0.02
-                max_flips: 3
-
-              - type: noise
-                noise_prob: 0.01
-                noise_min: 0
-                noise_max: 255
-
-          syst_to_comp:
-            enabled: true
-            strategies:
-              - type: drop
-                drop_prob: 0.1
-
-          injection:
-            enabled: true
-            direction: comp_to_syst
-            interval_ms: 2000
-            payload_len_min: 1
-            payload_len_max: 16
-
-    ports:
-      system:
-        - name: uart_syst
-          type: bytes
-        - name: uart_comp
-          type: bytes
-
-
-  # -------------------
   # Transceiver
   # -------------------
 
