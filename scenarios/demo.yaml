@@ -340,7 +340,7 @@ wires:
     - component: Mux
       port: uartB
 
-  - # Mux UART
+  - # Mux Transceiver
     - component: Mux
       port: uart
     - component: Transceiver
