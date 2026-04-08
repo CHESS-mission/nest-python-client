@@ -11,6 +11,7 @@ from typing import DefaultDict, List
 
 from nest_client.client import AsyncNestClient, NestClient
 from nest_client.config import DEFAULT_URL
+from nest_client.mutators.descriptor_runner import run_descriptor_file
 from nest_client.scenario import Scenario, ValidationResult
 from nest_client.sequence import Event
 from nest_client.time import s
@@ -299,6 +300,19 @@ def run_scenario(args):
     print_validation_report(scenario, results)
 
 
+def run_mutator(args):
+    scenario, results, url, scenario_seed, artifacts_dir = run_descriptor_file(args.descriptor, args.url)
+
+    print(f"Running scenario {scenario.name}")
+    print(f"Descriptor: {args.descriptor}")
+    print(f"Server URL: {url}")
+    if scenario_seed is not None:
+        print(f"Scenario mutation seed: {scenario_seed}")
+    print(f"Saved run artifacts to: {artifacts_dir}")
+
+    print_validation_report(scenario, results)
+
+
 
 def show_scenario(args):
     scenario = load_scenario(args.scenario)
@@ -333,12 +347,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     # run
     run_parser = subparsers.add_parser("run", help="Run a scenario")
-    run_parser.add_argument("scenario", help="module.function")
+    run_parser.add_argument("scenario", help="path/to/file.py:scenario_name")
     run_parser.set_defaults(func=run_scenario)
+
+    # run-mutator
+    descriptor_parser = subparsers.add_parser(
+        "run-mutator",
+        help="Run scenario/topology mutation workflow from a descriptor YAML file",
+    )
+    descriptor_parser.add_argument("descriptor", help="Path to descriptor YAML file")
+    descriptor_parser.set_defaults(func=run_mutator)
 
     # show
     show_parser = subparsers.add_parser("show", help="Show scenario timeline")
-    show_parser.add_argument("scenario", help="module.function")
+    show_parser.add_argument("scenario", help="path/to/file.py:scenario_name")
     show_parser.set_defaults(func=show_scenario)
 
     # list

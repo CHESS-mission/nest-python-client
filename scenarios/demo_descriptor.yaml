@@ -1,0 +1,31 @@
+# One-file mutation descriptor for nest-client run-descriptor
+
+run:
+  # Optional. Falls back to CLI --url value when omitted.
+  url: ws://localhost:3000/ws
+  # Where per-run trace folders are written.
+  artifacts_dir: mutations
+
+scenario:
+  # Path is resolved relative to this descriptor file.
+  script: demo.py
+  name: demo
+
+  # Mutate scenario timeline by injecting fuzzer start/stop commands.
+  mutate: true
+  seed: 12345
+  fuzzer_ids: ["net_fuzzer", "mem_fuzzer", "io_fuzzer"]
+  start_probability: 0.30
+  stop_probability: 0.30
+  stop_delay_min_s: 0.5
+  stop_delay_max_s: 2.0
+
+topology:
+  # Optional override of topology file used by the scenario.
+  # file: demo.yaml
+
+  # Mutate topology by inserting fuzzers between components.
+  mutate: true
+  seed: 0
+  persist_mutated: true
+  output_dir: mutations

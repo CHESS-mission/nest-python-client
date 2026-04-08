@@ -110,8 +110,7 @@ class Scenario:
         if self.persist_mutated_topology:
             output_dir = self.mutation_output_dir or self.topology_file.parent / "mutations"
             output_dir.mkdir(parents=True, exist_ok=True)
-            timestamp = int(time.time())
-            output_path = output_dir / f"{self.topology_file.stem}.mutated.{timestamp}.yaml"
+            output_path = output_dir / f"{self.topology_file.stem}.mutated.yaml"
             mutator.save_topology(mutated, output_path)
             logger.info("Saved mutated topology to %s", output_path)
 
