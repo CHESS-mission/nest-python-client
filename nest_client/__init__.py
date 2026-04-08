@@ -18,7 +18,7 @@ from .scenario import scenario
 from .sequence import sequence, timeline, command, event, set_env
 from .types import EnvVarType
 from .time import m, s, ms, us
-from .topology_mutator import TopologyMutator
+from .mutators.topology_mutator import TopologyMutator
 
 # Version
 from .__version__ import __version__

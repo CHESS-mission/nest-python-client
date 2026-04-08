@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Callable, Dict, List
 
 from nest_client.client import AsyncNestClient
-from nest_client.topology_mutator import TopologyMutator
+from nest_client.mutators.topology_mutator import TopologyMutator
 from nest_client.sequence import Command, Event, Sequence, SequenceOp, SetEnv
 from nest_client.time import Time, s
 #from nest_client.fuzz_oracle import FuzzOracle, FuzzResult
