@@ -547,7 +547,7 @@ class SEUResultDB:
                   f"bin={item.run_a_hash}  addr=0x{item.addr_a:08x}")
             print(f"  Run B   : {item.run_b_ts[:19]}  git={item.run_b_git}  "
                   f"bin={item.run_b_hash}  addr=0x{item.addr_b:08x}")
-            print(f"  Outcome : {item.outcome_a} → {item.outcome_b}")
+            print(f"  Outcome : {item.outcome_a} (A) VS {item.outcome_b} (B)")
             if item.evidence_a:
                 print(f"  Evid A  : {item.evidence_a[:100]}")
             if item.evidence_b:
@@ -555,9 +555,12 @@ class SEUResultDB:
 
         regs  = sum(1 for i in items if i.severity == "REGRESSION")
         crash = sum(1 for i in items if i.severity == "NEW_CRASH")
+        impr  = sum(1 for i in items if i.severity == "IMPROVEMENT")
+        other = len(items) - regs - crash - impr
         print(f"\n{'─' * w}")
         print(f"  Total changed : {len(items)}  "
-              f"regressions={regs}  new_crashes={crash}")
+              f"regressions={regs}  new_crashes={crash}  "
+              f"improvements={impr}  other={other}")
         if regs + crash > 0:
             print("  ⚠  Human review required for REGRESSION / NEW_CRASH items.")
         print("═" * w + "\n")
