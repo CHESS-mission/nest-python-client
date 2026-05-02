@@ -10,20 +10,27 @@ from unittest.mock import patch
 
 from nest_client.scenario import Scenario
 from nest_client.sequence import command
-from nest_client.time import s
+
+
+@dataclass(frozen=True)
+class FuzzerCommandTarget:
+    component: str
+    group: str
 
 
 @dataclass
 class ScenarioMutationOptions:
-    fuzzer_ids: list[str]
+    targets: list[FuzzerCommandTarget]
     start_probability: float = 0.3
     stop_probability: float = 0.3
-    stop_delay_min_s: float = 0.5
-    stop_delay_max_s: float = 2.0
 
 
 DEFAULT_SCENARIO_MUTATION_OPTIONS = ScenarioMutationOptions(
-    fuzzer_ids=["net_fuzzer", "mem_fuzzer", "io_fuzzer"],
+    targets=[
+        FuzzerCommandTarget(component="net_fuzzer", group="net_fuzzer"),
+        FuzzerCommandTarget(component="mem_fuzzer", group="mem_fuzzer"),
+        FuzzerCommandTarget(component="io_fuzzer", group="io_fuzzer"),
+    ],
 )
 
 
@@ -39,28 +46,51 @@ class FuzzingTimeline:
         self._inner = original_timeline()
         self._rng = rng
         self._options = options
+        self._active_targets: set[FuzzerCommandTarget] = set()
 
     def __enter__(self):
         self._inner.__enter__()
         return self
 
     def __setitem__(self, time, action):
-        # Randomly inject start_fuzzer BEFORE this action.
+        # Randomly enable a fuzz group BEFORE this action.
         if self._rng.random() < self._options.start_probability:
-            fid = self._rng.choice(self._options.fuzzer_ids)
-            self._inner[time] = command("fuzzer", "start_fuzzer", {"id": fid})
+            start_candidates = [
+                target
+                for target in self._options.targets
+                if target not in self._active_targets
+            ]
+            if start_candidates:
+                target = self._rng.choice(start_candidates)
+                self._inner[time] = command(
+                    target.component,
+                    "set_enabled",
+                    {
+                        "group": target.group,
+                        "direction": "both",
+                        "enabled": True,
+                    },
+                )
+                self._active_targets.add(target)
 
         # Original action.
         self._inner[time] = action
 
-        # Randomly inject stop_fuzzer AFTER this action.
+        # Randomly disable a fuzz group AFTER this action.
         if self._rng.random() < self._options.stop_probability:
-            fid = self._rng.choice(self._options.fuzzer_ids)
-            stop_time = time + self._rng.uniform(
-                self._options.stop_delay_min_s,
-                self._options.stop_delay_max_s,
-            ) * s
-            self._inner[stop_time] = command("fuzzer", "stop_fuzzer", {"id": fid})
+            stop_candidates = list(self._active_targets)
+            if stop_candidates:
+                target = self._rng.choice(stop_candidates)
+                self._inner[time] = command(
+                    target.component,
+                    "set_enabled",
+                    {
+                        "group": target.group,
+                        "direction": "both",
+                        "enabled": False,
+                    },
+                )
+                self._active_targets.discard(target)
 
     def __exit__(self, *exc_info):
         return self._inner.__exit__(*exc_info)
@@ -71,24 +101,18 @@ def normalize_options(
 ) -> ScenarioMutationOptions:
     if options is None:
         return ScenarioMutationOptions(
-            fuzzer_ids=list(DEFAULT_SCENARIO_MUTATION_OPTIONS.fuzzer_ids),
+            targets=list(DEFAULT_SCENARIO_MUTATION_OPTIONS.targets),
             start_probability=DEFAULT_SCENARIO_MUTATION_OPTIONS.start_probability,
             stop_probability=DEFAULT_SCENARIO_MUTATION_OPTIONS.stop_probability,
-            stop_delay_min_s=DEFAULT_SCENARIO_MUTATION_OPTIONS.stop_delay_min_s,
-            stop_delay_max_s=DEFAULT_SCENARIO_MUTATION_OPTIONS.stop_delay_max_s,
         )
 
-    if not options.fuzzer_ids:
-        raise ValueError("Scenario mutation requires at least one fuzzer ID")
+    if not options.targets:
+        raise ValueError("Scenario mutation requires at least one fuzzer target")
 
     if not (0.0 <= options.start_probability <= 1.0):
         raise ValueError("start_probability must be in [0, 1]")
     if not (0.0 <= options.stop_probability <= 1.0):
         raise ValueError("stop_probability must be in [0, 1]")
-    if options.stop_delay_min_s < 0:
-        raise ValueError("stop_delay_min_s must be >= 0")
-    if options.stop_delay_max_s < options.stop_delay_min_s:
-        raise ValueError("stop_delay_max_s must be >= stop_delay_min_s")
 
     return options
 
@@ -142,8 +166,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fuzzer-id", action="append", default=None, help="Fuzzer ID (repeatable)")
     parser.add_argument("--start-probability", type=float, default=0.3)
     parser.add_argument("--stop-probability", type=float, default=0.3)
-    parser.add_argument("--stop-delay-min", type=float, default=0.5)
-    parser.add_argument("--stop-delay-max", type=float, default=2.0)
     return parser
 
 
@@ -152,11 +174,13 @@ def main() -> None:
     args = parser.parse_args()
 
     options = ScenarioMutationOptions(
-        fuzzer_ids=args.fuzzer_id or list(DEFAULT_SCENARIO_MUTATION_OPTIONS.fuzzer_ids),
+        targets=(
+            [FuzzerCommandTarget(component=fid, group=fid) for fid in args.fuzzer_id]
+            if args.fuzzer_id
+            else list(DEFAULT_SCENARIO_MUTATION_OPTIONS.targets)
+        ),
         start_probability=args.start_probability,
         stop_probability=args.stop_probability,
-        stop_delay_min_s=args.stop_delay_min,
-        stop_delay_max_s=args.stop_delay_max,
     )
 
     scenario, seed = load_and_fuzz(args.script, args.scenario, args.seed, options)

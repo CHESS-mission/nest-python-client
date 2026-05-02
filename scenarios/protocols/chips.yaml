@@ -1,0 +1,8 @@
+name: chips
+
+components:
+  Transceiver:
+    payload_types:
+      "0x10": ascii
+      "0x20": u16_le
+      "0x21": u32_le

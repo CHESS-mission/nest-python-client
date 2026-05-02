@@ -1,0 +1,26 @@
+run:
+  url: ws://localhost:3000/ws
+  seed: 12345
+  artifacts_dir: mutations 
+
+scenario:
+  script: demo.py
+  name: demo
+  region: Transceiver
+  start_probability: 0.0
+  stop_probability: 0.0
+
+protocol:
+  kind: chips
+  spec: protocols/chips.yaml
+
+fuzz:
+  chips:
+    mode: typed
+    fields: [seq, command, payload]
+    payload_mode: bitflip
+    flip_prob: 0.20
+    max_flips: 2
+    payload_flip_prob: 0.10
+    max_payload_flips: 4
+    max_payload_extend: 16

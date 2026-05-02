@@ -98,7 +98,7 @@ components:
   - name: M4
     type: wasm
     config:
-      module: component_artifacts/m4.wasm
+      module: components/m4.wasm
       options:
         - ["heartbeat_timeout", "20"]
     ports:
@@ -150,7 +150,7 @@ components:
   - name: Transceiver
     type: wasm
     config:
-      module: component_artifacts/transceiver.wasm
+      module: components/transceiver.wasm
     ports:
       system:
         - name: uart
@@ -163,7 +163,7 @@ components:
   - name: PCT2075_0
     type: wasm
     config:
-      module: component_artifacts/pct2075tp147.wasm
+      module: components/pct2075tp147.wasm
       options:
         - ["i2cAddress", "0x48"]
     ports:
@@ -178,7 +178,7 @@ components:
   - name: PCT2075_1
     type: wasm
     config:
-      module: component_artifacts/pct2075tp147.wasm
+      module: components/pct2075tp147.wasm
       options:
         - ["i2cAddress", "0x49"]
     ports:
@@ -193,7 +193,7 @@ components:
   - name: PCT2075_2
     type: wasm
     config:
-      module: component_artifacts/pct2075tp147.wasm
+      module: components/pct2075tp147.wasm
       options:
         - ["i2cAddress", "0x4A"]
     ports:
@@ -208,7 +208,7 @@ components:
   - name: PCT2075_3
     type: wasm
     config:
-      module: component_artifacts/pct2075tp147.wasm
+      module: components/pct2075tp147.wasm
       options:
         - ["i2cAddress", "0x4B"]
     ports:
@@ -223,7 +223,7 @@ components:
   - name: PCT2075_4
     type: wasm
     config:
-      module: component_artifacts/pct2075tp147.wasm
+      module: components/pct2075tp147.wasm
       options:
         - ["i2cAddress", "0x4C"]
     ports:
@@ -238,7 +238,7 @@ components:
   - name: PCT2075_5
     type: wasm
     config:
-      module: component_artifacts/pct2075tp147.wasm
+      module: components/pct2075tp147.wasm
       options:
         - ["i2cAddress", "0x4D"]
     ports:
@@ -253,7 +253,7 @@ components:
   - name: PCT2075_6
     type: wasm
     config:
-      module: component_artifacts/pct2075tp147.wasm
+      module: components/pct2075tp147.wasm
       options:
         - ["i2cAddress", "0x4E"]
     ports:
@@ -268,7 +268,7 @@ components:
   - name: PCT2075_7
     type: wasm
     config:
-      module: component_artifacts/pct2075tp147.wasm
+      module: components/pct2075tp147.wasm
       options:
         - ["i2cAddress", "0x4F"]
     ports:
@@ -287,7 +287,7 @@ components:
   - name: IIM-42652
     type: wasm
     config:
-      module: component_artifacts/iim42652.wasm
+      module: components/iim42652.wasm
       options:
         - ["i2cAddress", "0x68"]
     ports:
@@ -305,7 +305,7 @@ components:
   - name: MMC5983MA
     type: wasm
     config:
-      module: component_artifacts/mmc5983ma.wasm
+      module: components/mmc5983ma.wasm
     ports:
       system:
         - name: i2c

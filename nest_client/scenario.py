@@ -7,7 +7,7 @@ import inspect
 import time
 import websockets
 from pathlib import Path
-from typing import Callable, Dict, List
+from typing import Any, Callable, Dict, List
 
 from nest_client.client import AsyncNestClient
 from nest_client.mutators.topology_mutator import TopologyMutator
@@ -36,6 +36,7 @@ class Scenario:
         persist_mutated_topology: bool = False,
         mutation_seed: int = 0,
         mutation_output_dir: Path | None = None,
+        topology_mutation_transform: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     ):
         self.name = name
         self.topology_file = topology_file
@@ -44,6 +45,7 @@ class Scenario:
         self.persist_mutated_topology = persist_mutated_topology
         self.mutation_seed = mutation_seed
         self.mutation_output_dir = mutation_output_dir
+        self.topology_mutation_transform = topology_mutation_transform
 
         self._events: List[dict] = []
         self._errors: List[dict] = []
@@ -106,6 +108,8 @@ class Scenario:
 
         mutator = TopologyMutator(base_seed=self.mutation_seed)
         mutated = mutator.mutate_file(self.topology_file)
+        if self.topology_mutation_transform is not None:
+            mutated = self.topology_mutation_transform(mutated)
 
         if self.persist_mutated_topology:
             output_dir = self.mutation_output_dir or self.topology_file.parent / "mutations"

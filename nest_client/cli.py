@@ -307,7 +307,7 @@ def run_mutator(args):
     print(f"Descriptor: {args.descriptor}")
     print(f"Server URL: {url}")
     if scenario_seed is not None:
-        print(f"Scenario mutation seed: {scenario_seed}")
+        print(f"Mutation seed (scenario + topology): {scenario_seed}")
     print(f"Saved run artifacts to: {artifacts_dir}")
 
     print_validation_report(scenario, results)
