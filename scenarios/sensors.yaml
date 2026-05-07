@@ -39,7 +39,7 @@ components:
         - option: device
           value: virtio-serial
         - option: chardev
-          value: pty,path=/tmp/qemu-serial-pty,id=char0
+          value: pipe,path=/tmp/qemu-serial-pty,id=char0
         - option: device
           value: virtconsole,chardev=char0
       i2c_timeout_ms: 10
