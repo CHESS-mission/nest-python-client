@@ -42,17 +42,30 @@ def red(text): return f"{Color.RED}{text}{Color.RESET}"
 
 def load_scenario(dotted_path: str) -> Scenario:
     """
-    Load scenario from dotted path
+    Load scenario from either a file path (/path/to/file.py:name)
+    or a dotted module path (module.name).
     """
-    try:
-        module_path, scenario_name = dotted_path.rsplit(".", 1)
-    except ValueError:
-        raise ValueError(
-            "Scenario must be specified as module.function "
-            "(e.g. scenarios.temperature.raise_temperature)"
-        )
+    if ":" in dotted_path:
+        file_path, scenario_name = dotted_path.rsplit(":", 1)
+        import importlib.util, pathlib
+        path = pathlib.Path(file_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Scenario file not found: {file_path}")
+        spec = importlib.util.spec_from_file_location(path.stem, path)
+        module = importlib.util.module_from_spec(spec)
+        sys.path.insert(0, str(path.parent))
+        sys.modules[path.stem] = module  # required so @scenario can find fn.__module__
+        spec.loader.exec_module(module)
+    else:
+        try:
+            module_path, scenario_name = dotted_path.rsplit(".", 1)
+        except ValueError:
+            raise ValueError(
+                "Scenario must be specified as /path/to/file.py:name "
+                "or module.name"
+            )
+        module = importlib.import_module(module_path)
 
-    module = importlib.import_module(module_path)
     obj = getattr(module, scenario_name)
 
     if not isinstance(obj, Scenario):

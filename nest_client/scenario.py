@@ -137,6 +137,12 @@ class Scenario:
             self._events.append(msg)
             logger.info(f"Received event: {msg}")
 
+        elif msg_type == "log":
+            level = msg.get("level", "info")
+            component = msg.get("component", "?")
+            message = msg.get("message", "")
+            getattr(logger, level, logger.info)(f"[{component}] {message}")
+
         elif msg_type == "error":
             self._errors.append(msg)
             raise RuntimeError(f"Simulation error: {msg}")
