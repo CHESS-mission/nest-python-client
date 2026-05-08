@@ -7,14 +7,14 @@ Purpose
 -------
 Raw addresses shift whenever a global variable is added before the target in
 BSS/data.  This module keys results by (symbol_demangled, field_name,
-bit_within_field) — a label that stays stable as long as the C++ class and
-field name don't change — so outcomes from different FS versions can be
+bit_within_field) a label that stays stable as long as the C++ class and
+field name don't change so outcomes from different FS versions can be
 compared automatically.
 
 Schema (two tables)
 -------------------
-  runs    — one row per test campaign (FS version, binary hash, timestamp)
-  results — one row per injection, FK to runs, enriched key columns
+  runs      one row per test campaign (FS version, binary hash, timestamp)
+  results   one row per injection, FK to runs, enriched key columns
 
 Typical usage (from a scenario)
 --------------------------------
@@ -27,17 +27,17 @@ Typical usage (from a scenario)
     db.record(run_id, addr, bit, original, flipped, write_ok,
               outcome, evidence, insn_count, elf_path)
 
-    # at end of run — print what changed vs. the previous run on any version:
+    # at end of run print what changed vs. the previous run on any version:
     db.print_review_queue(db.compare(run_id))
 
 Address enrichment
 ------------------
   enrich_address(addr, elf_path) resolves an address to:
-    symbol_name  — demangled C++ symbol (e.g. "CHESS::obcSensorsManager")
-    field_name   — DWARF member name    (e.g. "magConsecutiveFailures")
-    byte_offset  — addr - symbol.address
-    field_offset — byte offset of field within symbol (from DWARF)
-    field_bit_offset — (byte_offset - field_offset) * 8 + bit
+    symbol_name    demangled C++ symbol (e.g. "CHESS::obcSensorsManager")
+    field_name     DWARF member name    (e.g. "magConsecutiveFailures")
+    byte_offset    addr - symbol.address
+    field_offset   byte offset of field within symbol (from DWARF)
+    field_bit_offset   (byte_offset - field_offset) * 8 + bit
                        stable bit-position within the field across builds
 """
 
@@ -57,7 +57,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     pass
 
-# ── Schema ───────────────────────────────────────────────────────────────────
+# Schema
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS runs (
@@ -96,7 +96,7 @@ CREATE INDEX IF NOT EXISTS idx_results_run
     ON results(run_id);
 """
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# Helpers
 
 def _sha256(path: Path) -> str:
     h = hashlib.sha256()
@@ -124,7 +124,7 @@ def _git_hash(elf_path: Path) -> str | None:
     return None
 
 
-# ── Address enrichment ────────────────────────────────────────────────────────
+# Address enrichment
 
 @dataclass
 class AddrInfo:
@@ -151,13 +151,13 @@ class AddressEnricher:
     def __init__(self, elf_path: Path):
         self._elf = elf_path
         self._symbols: list | None = None      # list[SymbolInfo], sorted by address
-        self._field_cache: dict = {}           # sym.name → list[FieldInfo]
+        self._field_cache: dict = {}           # sym.name -> list[FieldInfo]
 
     def _ensure_symbols(self) -> list:
         if self._symbols is None:
             from nest_client.seu.elf_analyzer import analyze
             syms = analyze(self._elf)
-            # All symbols with a known size — data objects AND functions (.text)
+            # All symbols with a known size data objects AND functions (.text)
             self._symbols = sorted(
                 [s for s in syms if s.size > 0],
                 key=lambda s: s.address,
@@ -216,7 +216,7 @@ class AddressEnricher:
         )
 
 
-# ── Review item ───────────────────────────────────────────────────────────────
+# Review item
 
 @dataclass
 class ReviewItem:
@@ -261,9 +261,9 @@ class ReviewItem:
         return "CHANGED"
 
 
-# ── Database ──────────────────────────────────────────────────────────────────
+# Database
 
-# SP root = 4 levels up from this file (seu/result_db.py → seu/ → nest_client/ → nest-python-client/ → SP/)
+# SP root = 4 levels up from this file (seu/result_db.py -> seu/ -> nest_client/ -> nest-python-client/ -> SP/)
 _SP_ROOT = Path(__file__).resolve().parent.parent.parent.parent
 _DEFAULT_DB = Path(os.environ.get("SEU_DB", str(_SP_ROOT / "seu_history.db")))
 
@@ -297,7 +297,7 @@ class SEUResultDB:
     def __exit__(self, *_):
         self.close()
 
-    # ── Run management ────────────────────────────────────────────────────────
+    # Run management
 
     def start_run(
         self,
@@ -372,7 +372,7 @@ class SEUResultDB:
         self._con.commit()
         return n
 
-    # ── Result recording ──────────────────────────────────────────────────────
+    # Result recording
 
     def _enricher(self, elf_path: Path) -> AddressEnricher:
         key = str(elf_path)
@@ -430,7 +430,7 @@ class SEUResultDB:
         )
         self._con.commit()
 
-    # ── Comparison ────────────────────────────────────────────────────────────
+    # Comparison
 
     def compare(
         self,
@@ -521,12 +521,12 @@ class SEUResultDB:
 
     def print_review_queue(self, items: list[ReviewItem]) -> None:
         if not items:
-            print("\n[SEUResultDB] No outcome changes detected — runs are consistent.")
+            print("\n[SEUResultDB] No outcome changes detected runs are consistent.")
             return
 
         w = 78
         print("\n" + "═" * w)
-        print("  SEU REVIEW QUEUE — outcome changed between runs")
+        print("  SEU REVIEW QUEUE outcome changed between runs")
         print("═" * w)
 
         _colour = {
@@ -565,7 +565,7 @@ class SEUResultDB:
             print("  ⚠  Human review required for REGRESSION / NEW_CRASH items.")
         print("═" * w + "\n")
 
-    # ── Reporting ─────────────────────────────────────────────────────────────
+    # Reporting
 
     def print_run_summary(self, run_id: str) -> None:
         """Print a per-injection table with DWARF field names, then outcome totals."""
@@ -592,7 +592,7 @@ class SEUResultDB:
             print(f"  Git: {meta['fs_git_hash']}")
         print(f"  At : {meta['timestamp'][:19]}")
         print()
-        print(f"  {'ADDR':>10}  {'B':>1}  {'BEFORE→AFTER':^19}  {'SECTION':<6}  {'SYMBOL / FIELD':<44}  {'OUTCOME':<10}  EVIDENCE")
+        print(f"  {'ADDR':>10}  {'B':>1}  {'BEFORE->AFTER':^19}  {'SECTION':<6}  {'SYMBOL / FIELD':<44}  {'OUTCOME':<10}  EVIDENCE")
         print(f"  {'─'*10}  {'─':>1}  {'─'*19}  {'─'*6}  {'─'*44}  {'─'*10}  {'─'*40}")
 
         for r in detail:
@@ -603,14 +603,14 @@ class SEUResultDB:
             orig = r["original"]
             flip = r["flipped"]
             if orig is not None and flip is not None:
-                bits = f"{orig:08b}→{flip:08b}"
+                bits = f"{orig:08b}->{flip:08b}"
             else:
                 bits = "?" * 19
             # Compact the evidence to its essential content:
             # "[EVR] EVENT: (...) WARNING_HI: (comQueue) QueueOverflow : ..."
-            # → "QueueOverflow (comQueue)"
+            # -> "QueueOverflow (comQueue)"
             # "[OS] Segmentation fault (core dumped)"
-            # → "Segmentation fault"
+            # -> "Segmentation fault"
             import re as _re
             ev_short = ev
             if "[EVR]" in ev:
@@ -673,7 +673,7 @@ class SEUResultDB:
         return len(rows)
 
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
+# CLI
 
 def _cli():
     import argparse, sys

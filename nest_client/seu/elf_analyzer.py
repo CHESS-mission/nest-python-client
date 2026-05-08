@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-elf_analyzer.py — Extract fault-injection targets from the CHESS ARM ELF binary.
+elf_analyzer.py Extract fault-injection targets from the CHESS ARM ELF binary.
 
 Usage
 -----
@@ -18,13 +18,13 @@ Options
 
 What it finds
 -------------
-  • Every global symbol in .data / .bss / .rodata  — the variables that an
+  • Every global symbol in .data / .bss / .rodata the variables that an
     SEU can flip.
   • Symbols whose demangled name contains FPrime component identifiers
     (Svc::, Fw::, health, state, mode, count, timer …) are flagged as
     high-value injection targets.
   • For each symbol we emit: name, demangled name, virtual address, size,
-    section — exactly what fault_injector.py needs to schedule an injection.
+    section exactly what fault_injector.py needs to schedule an injection.
 
 Requirements
 ------------
@@ -36,10 +36,12 @@ Requirements
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
@@ -48,13 +50,9 @@ try:
     from elftools.elf.sections import SymbolTableSection
     from elftools.elf.descriptions import describe_symbol_type, describe_symbol_bind
 except ImportError:
-    sys.exit(
-        "ERROR: pyelftools not installed.\n"
-        "  pip install pyelftools\n"
-        "  or, inside the fprime venv: pip install pyelftools"
-    )
+    print("WARNING: pyelftools not installed. DWARF analysis disabled.")
 
-# ── DWARF field-expansion helpers ────────────────────────────────────────────
+# DWARF field-expansion helpers
 
 def _build_die_index(dwarf_info) -> dict:
     """Build {absolute_offset: DIE} index across all CUs."""
@@ -244,12 +242,12 @@ def expand_symbol_fields(elf_path: Path,
         print("Building DWARF index (may take a few seconds)…", file=sys.stderr)
         die_index = _build_die_index(dwarf)
 
-        # Build forward-declaration → full-definition map.
+        # Build forward-declaration -> full-definition map.
         # A forward declaration has DW_AT_declaration=True and no member children.
         # The full definition has the same DW_AT_name and no DW_AT_declaration.
         _tags = ('DW_TAG_class_type', 'DW_TAG_structure_type', 'DW_TAG_union_type')
-        decls: dict[str, int] = {}   # name → declaration offset
-        fwd_map: dict[int, object] = {}  # decl_offset → full def DIE
+        decls: dict[str, int] = {}   # name -> declaration offset
+        fwd_map: dict[int, object] = {}  # decl_offset -> full def DIE
         for _die in die_index.values():
             if _die.tag not in _tags:
                 continue
@@ -292,7 +290,7 @@ def expand_symbol_fields(elf_path: Path,
                     type_die = die_index.get(_ref_abs(type_attr, cu))
                     results[sym.name] = _collect_fields(type_die, die_index, fwd_map=fwd_map)
 
-        # ── Fallback: match variable DIE by DW_AT_name when location was a list ──
+        # Fallback: match variable DIE by DW_AT_name when location was a list
         # RelWithDebInfo may use location lists (not simple DW_OP_addr), making
         # the address-based match above fail.  Match the variable DIE by its
         # unqualified DW_AT_name instead, then follow DW_AT_type for fields.
@@ -300,7 +298,16 @@ def expand_symbol_fields(elf_path: Path,
         if unresolved:
             def _tail(demangled: str) -> str:
                 base = demangled.split('<')[0].rstrip()
-                return base.split('::')[-1]
+                part = base.split('::')[-1]
+                # If demangling failed (name still starts with _Z), extract the
+                # last C++ identifier via the length-prefixed encoding: e.g.
+                # '_ZN5CHESS17obcSensorsManagerE' -> 'obcSensorsManager'
+                if part.startswith('_Z'):
+                    import re as _re
+                    ids = _re.findall(r'\d+([A-Za-z_]\w*)', part)
+                    if ids:
+                        return ids[-1]
+                return part
             by_tail = {_tail(s.demangled): s for s in unresolved}
 
             for cu in dwarf.iter_CUs():
@@ -327,7 +334,7 @@ def print_expansion(sym: SymbolInfo, fields: list[FieldInfo]) -> None:
     print(f"  base addr : 0x{sym.address:010x}")
     print(f"  total size: {sym.size} bytes")
     if not fields:
-        print("  (no DWARF member info — is this the debug binary?)")
+        print("  (no DWARF member info is this the debug binary?)")
         return
     hdr = f"  {'OFFSET':>8}  {'ABS ADDR':>12}  {'SIZE':>5}  {'TYPE':<32}  FIELD"
     print(hdr)
@@ -344,7 +351,7 @@ def print_expansion(sym: SymbolInfo, fields: list[FieldInfo]) -> None:
     print(f"\n  {len(fields)} fields total, {len(targets)} potential SEU targets "
           f"(non-ptr, ≤8 bytes)")
 
-# ── Constants ────────────────────────────────────────────────────────────────
+# Constants
 
 # FPrime / CHESS-specific patterns that make a symbol a high-value SEU target
 _FPRIME_PATTERNS = re.compile(
@@ -362,7 +369,7 @@ _WRITABLE_SECTIONS = {".data", ".bss", ".sbss", ".sdata", ".noinit"}
 _DATA_TYPES = {"OBJECT", "COMMON", "TLS"}
 
 
-# ── Data class ───────────────────────────────────────────────────────────────
+# Data class
 
 @dataclass
 class SymbolInfo:
@@ -380,7 +387,7 @@ class SymbolInfo:
         Return a list of {addr, bit} dicts covering every bit in this symbol.
 
         skip_bytes : skip the first N bytes (use to avoid vtable pointer region
-                     in C++ objects — typically 32-64 bytes for FPrime components)
+                     in C++ objects typically 32-64 bytes for FPrime components)
         bits       : list of bit positions to test per byte (default: all 8)
         """
         targets = []
@@ -402,10 +409,10 @@ class SymbolInfo:
         strategic offsets rather than exhaustively covering every bit.
 
         Strategy:
-          - Skip the first `vtable_skip` bytes (vtable pointers → always CRASH,
+          - Skip the first `vtable_skip` bytes (vtable pointers -> always CRASH,
             not interesting for DETECTED/MASKED analysis)
           - Sample every 4 bytes (word-aligned) past the vtable region
-          - Test only bits 0, 3, 7 per byte (LSB, middle, MSB — representative)
+          - Test only bits 0, 3, 7 per byte (LSB, middle, MSB representative)
         """
         if self.size <= vtable_skip:
             return []
@@ -421,7 +428,7 @@ class SymbolInfo:
         return targets
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# Helpers
 
 def _demangle(names: list[str]) -> list[str]:
     """Run c++filt on a batch of names for efficiency."""
@@ -446,7 +453,83 @@ def _section_name(elf: ELFFile, sym) -> str:
     return str(shndx)  # e.g. 'SHN_ABS', 'SHN_UNDEF'
 
 
-# ── Core analysis ────────────────────────────────────────────────────────────
+# Symbol cache
+
+def _elf_sha256(elf_path: Path) -> str:
+    h = hashlib.sha256()
+    with elf_path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _default_cache_path(elf_path: Path) -> Path:
+    import os
+    cache_dir = Path(os.environ.get("SEU_CACHE_DIR", "/tmp"))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / f"seu_elf_{elf_path.stem}.json"
+
+
+def _load_cache(cache_path: Path, elf_sha: str) -> list[SymbolInfo] | None:
+    """Return cached symbols if the cache file exists and hash matches."""
+    if not cache_path.exists():
+        return None
+    try:
+        data = json.loads(cache_path.read_text())
+        if data.get("elf_sha256") != elf_sha:
+            return None
+        return [SymbolInfo(**s) for s in data["symbols"]]
+    except Exception:
+        return None
+
+
+def _save_cache(cache_path: Path, elf_sha: str, symbols: list[SymbolInfo]) -> None:
+    try:
+        cache_path.write_text(json.dumps({
+            "elf_sha256": elf_sha,
+            "created":    time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "symbols":    [asdict(s) for s in symbols],
+        }, indent=2))
+    except Exception as e:
+        print(f"WARNING: could not write ELF cache to {cache_path}: {e}", file=sys.stderr)
+
+
+def analyze_cached(elf_path: Path,
+                   filter_re: re.Pattern | None = None,
+                   cache_path: Path | None = None) -> list[SymbolInfo]:
+    """
+    Like analyze(), but caches results keyed by the ELF's SHA-256 hash.
+    Subsequent calls with the same (unchanged) binary return instantly.
+
+    cache_path defaults to /tmp/seu_elf_<stem>.json.
+    Pass cache_path=False to disable caching.
+    """
+    cp = None if cache_path is False else (cache_path or _default_cache_path(elf_path))
+
+    if cp is not None:
+        sha = _elf_sha256(elf_path)
+        cached = _load_cache(cp, sha)
+        if cached is not None:
+            # Apply filter_re post-load so we can reuse the same cache for
+            # different filter patterns without re-parsing the ELF.
+            if filter_re:
+                cached = [s for s in cached if filter_re.search(s.demangled)]
+            print(f"ELF analysis: loaded {len(cached)} symbols from cache "
+                  f"({cp.name})", file=sys.stderr)
+            return cached
+
+    symbols = analyze(elf_path, filter_re=None)  # always store full set in cache
+
+    if cp is not None:
+        _save_cache(cp, sha, symbols)
+        print(f"ELF analysis: cached {len(symbols)} symbols -> {cp}", file=sys.stderr)
+
+    if filter_re:
+        symbols = [s for s in symbols if filter_re.search(s.demangled)]
+    return symbols
+
+
+# Core analysis
 
 def analyze(elf_path: Path, filter_re: re.Pattern | None = None) -> list[SymbolInfo]:
     """
@@ -519,7 +602,7 @@ def analyze(elf_path: Path, filter_re: re.Pattern | None = None) -> list[SymbolI
     return symbols
 
 
-# ── Output formatters ─────────────────────────────────────────────────────────
+# Output formatters
 
 def print_table(symbols: list[SymbolInfo], candidates_only: bool = False) -> None:
     data = [s for s in symbols if (not candidates_only or s.is_candidate)]
@@ -545,26 +628,86 @@ def print_json(symbols: list[SymbolInfo], candidates_only: bool = False) -> str:
     return json.dumps(data, indent=2)
 
 
-# ── Candidate export (used by fault_injector.py) ─────────────────────────────
+# Candidate export (used by fault_injector.py)
+
+def get_stratified_sample(elf_path: Path,
+                          n: int,
+                          rng,
+                          candidates_only: bool = True,
+                          vtable_skip: int = 64,
+                          ) -> list[dict]:
+    """
+    Return n injection targets sampled **uniformly across symbols** (not bytes).
+
+    Each candidate symbol gets equal probability of being picked regardless of
+    its size.  For each selected symbol a random byte offset and bit are chosen.
+    This prevents large buffers (cmdSeq 4 KB, tlmSend 580 KB) from drowning out
+    small but safety-critical objects (rateGroupDriver 736 B, mallocator 4 B).
+
+    vtable_skip : skip the first N bytes of each object (vtable pointer region).
+    """
+    symbols = [s for s in analyze_cached(elf_path)
+               if (not candidates_only or s.is_candidate) and s.size > 0]
+    if not symbols:
+        return []
+
+    targets = []
+    for _ in range(n):
+        sym = rng.choice(symbols)
+        skip = min(vtable_skip, sym.size - 1)
+        byte_off = rng.randint(skip, sym.size - 1)
+        bit = rng.randint(0, 7)
+        targets.append({
+            "addr":        sym.address + byte_off,
+            "bit":         bit,
+            "symbol":      sym.demangled,
+            "byte_offset": byte_off,
+        })
+    return targets
+
+
+def summarise_candidates(elf_path: Path, candidates_only: bool = True) -> list[dict]:
+    """
+    Return a sorted list of candidate symbols with their size for display.
+    """
+    symbols = [s for s in analyze_cached(elf_path)
+               if (not candidates_only or s.is_candidate) and s.size > 0]
+    return sorted(
+        [{"name": s.demangled, "size": s.size, "addr": s.address,
+          "section": s.section} for s in symbols],
+        key=lambda x: x["size"], reverse=True,
+    )
+
 
 def get_injection_targets(elf_path: Path,
                           candidates_only: bool = True,
-                          filter_re: re.Pattern | None = None
+                          filter_re: re.Pattern | None = None,
+                          max_symbol_bytes: int = 8192,
                           ) -> list[dict]:
     """
     High-level function: return a flat list of {addr, bit, symbol, byte_offset}
     dicts ready for injection scheduling.  Called by fault_injector.py.
+
+    Symbols larger than max_symbol_bytes are sampled with smart_targets()
+    (every 4 bytes, 3 bits) instead of the exhaustive bit_targets() (every
+    byte, every bit).  This prevents huge buffers like CdhCore::tlmSend
+    (593 KB, 4.75 M targets) from dominating random-sweep samples.
     """
-    symbols = analyze(elf_path, filter_re=filter_re)
+    symbols = analyze_cached(elf_path, filter_re=filter_re)
     targets = []
     for s in symbols:
         if candidates_only and not s.is_candidate:
+            continue
+        if s.size > max_symbol_bytes:
+            # Huge buffers (telemetry rings, log stores) are mostly unallocated
+            # demand-paged BSS reads fail and they contribute nothing interesting
+            # to an SEU campaign. Skip them entirely.
             continue
         targets.extend(s.bit_targets())
     return targets
 
 
-# ── CLI entry point ───────────────────────────────────────────────────────────
+# CLI entry point
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -614,7 +757,7 @@ def main() -> None:
     if args.expand:
         obj_symbols = [s for s in symbols if s.sym_type in _DATA_TYPES]
         if not obj_symbols:
-            print("(no OBJECT symbols match — try adjusting --filter)")
+            print("(no OBJECT symbols match try adjusting --filter)")
             return
         field_map = expand_symbol_fields(elf_path, obj_symbols)
         for s in obj_symbols:

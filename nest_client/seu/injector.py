@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-fault_injector.py — Python client for the fault_inject TCG plugin.
+fault_injector.py Python client for the fault_inject TCG plugin.
 
 This module provides:
-  • FaultInjectorClient  — low-level JSON socket client
-  • InjectionScheduler   — higher-level scheduler that waits for the right
-                           instruction-count window and fires injections
-  • InjectionResult      — dataclass for structured results
-  • SEUCampaign          — runs a sequence of injections and records outcomes
+  • FaultInjectorClient   low-level JSON socket client
+  • InjectionScheduler    higher-level scheduler that waits for the right
+                          instruction-count window and fires injections
+  • InjectionResult       dataclass for structured results
+  • SEUCampaign           runs a sequence of injections and records outcomes
 
 Typical use (manual Phase 1)
 -----------------------------
@@ -35,17 +35,26 @@ Typical use (automated Phase 2)
 from __future__ import annotations
 
 import json
+import os
+import re
 import socket
+import struct
 import time
 import threading
 import dataclasses
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, Optional
-import re
+from typing import Callable, Iterable, Optional, Tuple, Union
 
 
-# ── GDB Remote Serial Protocol memory writer ─────────────────────────────────
+CHESS_READY_KEYWORDS: list[str] = [
+    "CHESS_Pathfinder0FS", "OpCodeRegistered", "Starting HealthImpl",
+    "Registered with", "all components ready", "rate group", "SENSOR_POLL_CYCLE",
+    "EVENT:",  # steady-state F' telemetry — proof CHESS is alive after boot
+]
+
+# GDB Remote Serial Protocol memory writer
 
 class GdbMemWriter:
     """
@@ -58,14 +67,14 @@ class GdbMemWriter:
       4. Send  $c#63  to resume the guest.
       5. Disconnect.
 
-    The halt lasts <1 ms under TCG — well below FPrime's health watchdog.
+    The halt lasts <1 ms under TCG well below FPrime's health watchdog.
     """
 
     def __init__(self, host: str = "localhost", port: int = 1234):
         self.host = host
         self.port = port
 
-    # ── GDB packet helpers ────────────────────────────────────────────────────
+    # GDB packet helpers
 
     @staticmethod
     def _csum(data: str) -> str:
@@ -75,7 +84,27 @@ class GdbMemWriter:
     def _pkt(data: str) -> bytes:
         return f"${data}#{GdbMemWriter._csum(data)}".encode("ascii")
 
-    # ── Public API ────────────────────────────────────────────────────────────
+    # Session context manager
+
+    @contextmanager
+    def _session(self):
+        """Connect to GDB stub, halt the vCPU, yield (socket, stop_reply).
+
+        The stop_reply is the T/S packet from QEMU after Ctrl-C; it contains
+        the current PC and is needed by resume_cpu to clear stale breakpoints.
+        Methods that don't need it can unpack as ``with self._session() as (s, _)``.
+        Callers are responsible for sending ``$c`` to resume before the context
+        exits.
+        """
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(5.0)
+            s.connect((self.host, self.port))
+            s.sendall(b"\x03")
+            time.sleep(0.3)
+            stop_reply = self._recv_pkt(s, timeout=1.0)
+            yield s, stop_reply
+
+    # Public API
 
     @staticmethod
     def _recv_pkt(s: socket.socket, timeout: float = 3.0) -> str:
@@ -108,40 +137,211 @@ class GdbMemWriter:
                 break
         return ""
 
+    def monitor_command(self, cmd: str) -> str:
+        """
+        Send a QEMU human-monitor command via GDB RSP qRcmd passthrough.
+
+        Returns the response string (stripped of leading 'O' output packets).
+        Useful for physical-memory writes: ``writel PHYS_ADDR VALUE``.
+        """
+        try:
+            with self._session() as (s, _):
+                hex_cmd = cmd.encode("ascii").hex()
+                s.sendall(self._pkt(f"qRcmd,{hex_cmd}"))
+                # Drain: QEMU sends 0..N  "O<hex_text>" output packets then "OK"
+                result = ""
+                deadline = time.monotonic() + 3.0
+                while time.monotonic() < deadline:
+                    resp = self._recv_pkt(s, timeout=1.0)
+                    if not resp:
+                        break
+                    if resp == "OK":
+                        result = "OK"
+                        break
+                    if resp.startswith("O"):
+                        try:
+                            result += bytes.fromhex(resp[1:]).decode("ascii", errors="replace")
+                        except Exception:
+                            pass
+                    elif resp.startswith("E"):
+                        result = resp
+                        break
+                s.sendall(self._pkt("c"))
+                return result
+        except Exception:
+            return ""
+
+    def writes_and_reads(self,
+                         writes: list[tuple[int, int]],
+                         reads:  list[tuple[int, int]]) -> list[bytes]:
+        """
+        Halt once, execute all writes then all reads, resume.
+
+        Returns a list of bytes, one per read tuple (b"" on failure).
+        All operations share the same GDB halt / MMU context.
+        """
+        results: list[bytes] = []
+        try:
+            with self._session() as (s, _):
+                # Select CPU_A (thread 1) so memory ops target CHESS, not CPU_B/M4A.
+                s.sendall(self._pkt("Hg1"))
+                self._recv_pkt(s, timeout=1.0)
+                for addr, value in writes:
+                    le_hex = struct.pack("<I", value).hex()
+                    s.sendall(self._pkt(f"M{addr:x},4:{le_hex}"))
+                    self._recv_pkt(s, timeout=2.0)
+                for addr, length in reads:
+                    s.sendall(self._pkt(f"m{addr:x},{length:x}"))
+                    resp = self._recv_pkt(s, timeout=max(2.0, length / 500))
+                    data = (bytes.fromhex(resp)
+                            if resp and all(c in "0123456789abcdefABCDEF" for c in resp)
+                            else b"")
+                    results.append(data)
+                s.sendall(self._pkt("c"))
+                # Wait for '+' ACK so QEMU processes 'c' before socket close.
+                # Without this, QEMU 10.x may leave the CPU halted.
+                s.settimeout(5.0)
+                try:
+                    s.recv(64)
+                except (socket.timeout, OSError):
+                    pass
+        except Exception:
+            while len(results) < len(reads):
+                results.append(b"")
+        return results
+
+    def read_bulk(self, reads: list[tuple[int, int]]) -> list[bytes]:
+        """
+        Halt the CPU once, send one $m request per (addr, length) pair, then resume.
+
+        All reads share a single GDB halt, so they are all taken from the same
+        CPU/MMU context.  If the CPU halted in the wrong process (kernel or a
+        different user process), every individual read will return b"" and the
+        caller should retry.
+
+        Parameters
+        ----------
+        reads : list of (guest_vaddr, byte_count) pairs
+
+        Returns
+        -------
+        List of bytes objects, one per input pair (b"" on individual read failure).
+        """
+        results: list[bytes] = []
+        try:
+            with self._session() as (s, _):
+                # Select CPU_A (thread 1) so reads target CHESS, not CPU_B/M4A.
+                s.sendall(self._pkt("Hg1"))
+                self._recv_pkt(s, timeout=1.0)
+                for addr, length in reads:
+                    s.sendall(self._pkt(f"m{addr:x},{length:x}"))
+                    # Timeout scaled to data size; minimum 2 s
+                    resp = self._recv_pkt(s, timeout=max(2.0, length / 500))
+                    data = (bytes.fromhex(resp)
+                            if resp and len(resp) % 2 == 0
+                            and all(c in "0123456789abcdefABCDEF" for c in resp)
+                            else b"")
+                    results.append(data)
+                s.sendall(self._pkt("c"))
+                s.settimeout(5.0)
+                try:
+                    s.recv(64)
+                except (socket.timeout, OSError):
+                    pass
+        except Exception:
+            while len(results) < len(reads):
+                results.append(b"")
+        return results
+
+    def redirect_pc(self, bad_pc: int) -> tuple[bool, int, int]:
+        """
+        Halt CPU, set PC (ARM register 15) to *bad_pc* via ``$G`` (write all
+        registers), verify by read-back, then resume.
+
+        Returns ``(write_ok, pc_before, pc_after)``.  ``write_ok`` is True only
+        if the read-back PC matches *bad_pc*.
+
+        Uses ``$G`` (write-all-registers) rather than ``$P`` (individual write)
+        because some QEMU builds return OK for ``$P`` without applying it.
+        """
+        try:
+            with self._session() as (s, _):
+                # Read all registers ($g): ARM has ≥ 26 regs in GDB register file.
+                # Core GPRs r0-r15 occupy the first 64 bytes (128 hex chars).
+                s.sendall(self._pkt("g"))
+                all_regs = self._recv_pkt(s, timeout=2.0)
+                if not all_regs or len(all_regs) < 128:
+                    s.sendall(self._pkt("c"))
+                    return False, 0, 0
+
+                pc_before = struct.unpack("<I", bytes.fromhex(all_regs[60*2:64*2]))[0]
+
+                # Patch r15 (bytes 60–63 in the LE register dump)
+                le_hex   = struct.pack("<I", bad_pc).hex()
+                modified = all_regs[:60*2] + le_hex + all_regs[64*2:]
+
+                # Write all registers ($G)
+                s.sendall(self._pkt(f"G{modified}"))
+                self._recv_pkt(s, timeout=2.0)
+
+                # Read back to confirm
+                s.sendall(self._pkt("g"))
+                verify = self._recv_pkt(s, timeout=2.0)
+                pc_after = 0
+                if verify and len(verify) >= 128:
+                    pc_after = struct.unpack("<I", bytes.fromhex(verify[120:128]))[0]
+
+                write_ok = pc_after == bad_pc
+                s.sendall(self._pkt("c"))
+                return write_ok, pc_before, pc_after
+        except Exception:
+            return False, 0, 0
+
+    def resume_cpu(self) -> None:
+        """Resume a halted vCPU. No-op if CPU is already running.
+
+        Connects, sends Ctrl-C to get current state, removes any pending SW BP
+        at the current PC (to break stale-BP re-halt loops), then sends 'c'.
+        """
+        try:
+            with self._session() as (s, stop_reply):
+                # T05 reply format: "T05 pc:XXXXXXXX;..." (GDB RSP key-value pairs)
+                # Parse PC and remove any stale SW BP to break re-halt loops.
+                if stop_reply and "pc:" in stop_reply:
+                    try:
+                        pc_hex = stop_reply.split("pc:")[1].split(";")[0]
+                        pc = int(pc_hex, 16) & ~1  # strip THUMB bit
+                        for kind in (2, 4):
+                            s.sendall(self._pkt(f"z0,{pc:x},{kind}"))
+                            self._recv_pkt(s, timeout=1.0)
+                    except Exception:
+                        pass
+                s.sendall(self._pkt("c"))
+                s.settimeout(5.0)
+                try:
+                    s.recv(64)
+                except (socket.timeout, OSError):
+                    pass
+        except Exception:
+            pass
+
     def write_byte(self, addr: int, value: int) -> bool:
         """
         Halt QEMU, overwrite the byte at *addr* with *value*, then resume.
         Returns True if QEMU acknowledged the write with OK.
         """
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.settimeout(5.0)
-                s.connect((self.host, self.port))
-
-                # 1. Halt: send Ctrl-C interrupt.
-                #    Sleep 0.3 s to let QEMU flush the stop-reply through TCP
-                #    before we start draining (avoids a tight-loop race).
-                s.sendall(b"\x03")
-                time.sleep(0.3)
-                self._recv_pkt(s, timeout=1.0)  # consume stop-reply (T02/S02)
-
-                # 2. Write memory: $M<addr>,1:<byte>#<csum>
-                data = f"M{addr:x},1:{value:02x}"
-                s.sendall(self._pkt(data))
+            with self._session() as (s, _):
+                s.sendall(self._pkt(f"M{addr:x},1:{value:02x}"))
                 resp = self._recv_pkt(s, timeout=2.0)
                 write_ok = resp == "OK"
-
-                # 3. Resume guest: $c#63
                 s.sendall(self._pkt("c"))
-                # Don't wait for stop-reply — guest continues on its own.
-
                 return write_ok
-
         except Exception:
             return False
 
 
-# ── Low-level client ─────────────────────────────────────────────────────────
+# Low-level client
 
 class PluginError(RuntimeError):
     pass
@@ -152,6 +352,8 @@ class InjectionSpec:
     addr: int              # guest virtual address (byte to flip)
     bit: int               # bit index 0-7 within the byte
     delay: int = 5_000_000 # instructions from *now* to inject
+    symbol: str = ""       # demangled symbol name (optional)
+    byte_offset: int = 0   # byte offset within the symbol
 
 
 @dataclass
@@ -165,9 +367,12 @@ class InjectionResult:
     outcome: str = "unknown"  # set by oracle: CRASH / DETECTED / MASKED / BENIGN
 
     def summary(self) -> str:
+        sym_info = ""
+        if self.spec.symbol:
+            sym_info = f" ({self.spec.symbol} + {self.spec.byte_offset})"
         return (
-            f"addr=0x{self.spec.addr:08x} bit={self.spec.bit} "
-            f"0x{self.original:02x}→0x{self.flipped:02x} "
+            f"addr=0x{self.spec.addr:08x}{sym_info} bit={self.spec.bit} "
+            f"0x{self.original:02x}->0x{self.flipped:02x} "
             f"ok={self.success} insn={self.trigger_insn:,} "
             f"outcome={self.outcome}"
         )
@@ -199,7 +404,7 @@ class FaultInjectorClient:
         self.socket_path = str(socket_path)
         self._gdb = GdbMemWriter(gdb_host, gdb_port) if gdb_port else None
 
-    # ── Context manager ──────────────────────────────────────────────────────
+    # Context manager
 
     def __enter__(self):
         self.wait_for_socket()
@@ -208,7 +413,7 @@ class FaultInjectorClient:
     def __exit__(self, *_):
         pass
 
-    # ── Helpers ──────────────────────────────────────────────────────────────
+    # Helpers
 
     def wait_for_socket(self, timeout: float = CONNECT_TIMEOUT) -> None:
         """Block until the plugin socket file appears."""
@@ -244,7 +449,7 @@ class FaultInjectorClient:
             raise PluginError(f"Plugin error: {resp.get('msg', resp)}")
         return resp
 
-    # ── API ──────────────────────────────────────────────────────────────────
+    # API
 
     def get_count(self) -> int:
         """Return the current instruction count from the plugin."""
@@ -312,19 +517,25 @@ class FaultInjectorClient:
                 if trigger_insn is not None and int(r.get("insn_count", 0)) < trigger_insn:
                     time.sleep(poll_interval)
                     continue
-                # Plugin signalled trigger — perform GDB write if available
+                # Plugin signalled trigger perform GDB write if available.
+                # When the plugin read failed (demand-paged BSS not faulted in),
+                # r["flipped"] is stale/zero. Recompute from original and bit.
                 if not r.get("success") and self._gdb is not None:
-                    addr    = int(r["addr"])
-                    flipped = int(r["flipped"])
+                    addr     = int(r["addr"])
+                    bit      = int(r.get("bit", 0))
+                    original = int(r.get("original", 0))
+                    flipped  = original ^ (1 << bit)
                     ok = self._gdb.write_byte(addr, flipped)
-                    r["success"] = ok
+                    r["original"] = original
+                    r["flipped"]  = flipped
+                    r["success"]  = ok
                     r["gdb_write"] = True
                 return r
             time.sleep(poll_interval)
         return None
 
 
-# ── Oracle: monitor PTY log for crash / detection signals ────────────────────
+# Oracle: monitor PTY log for crash / detection signals
 
 class PtyOracle:
     """
@@ -332,11 +543,11 @@ class PtyOracle:
 
     Outcomes
     --------
-    CRASH     — guest/process died: kernel panic, SIGSEGV, FPrime Assert, or
+    CRASH       guest/process died: kernel panic, SIGSEGV, FPrime Assert, or
                 the FS stopped producing EVENT lines entirely (liveness timeout).
-    DETECTED  — FPrime's Svc::Health or any component logged a WARNING/ERROR/
+    DETECTED    FPrime's Svc::Health or any component logged a WARNING/ERROR/
                 FATAL-severity EVR (generic, works for any component).
-    MASKED    — FS kept running and no anomaly was logged.
+    MASKED      FS kept running and no anomaly was logged.
 
     Design rationale
     ----------------
@@ -345,36 +556,61 @@ class PtyOracle:
     1. OS/process crash strings (kernel panic, segfault, abort, …).
     2. FPrime-level crash: "Assert:" in the output (FW_ASSERT fires before exit).
     3. FPrime EVR severity: any EVR line that carries WARNING / ERROR / FATAL
-       in its severity field — covers Svc::Health ping warnings AND any future
+       in its severity field covers Svc::Health ping warnings AND any future
        component that reports a fault through FPrime's event system.
     4. Liveness: if no "EVENT:" line appears for >LIVENESS_TIMEOUT_S seconds
        the FS is considered silent/crashed.
     """
 
-    # ── 1. OS / process-level crash ──────────────────────────────────────────
+    # 1. OS / process-level crash
     _OS_CRASH_RE = re.compile(
         r"Kernel panic|Oops:|segfault|SIGSEGV|illegal instruction"
         r"|Aborted|core dumped|BUG: Bad page",
         re.IGNORECASE,
     )
 
-    # ── 2. FPrime process-level abort (FW_ASSERT prints "Assert: <file>:<line>")
+    # 2. FPrime process-level abort (FW_ASSERT prints "Assert: <file>:<line>")
     _FPRIME_ASSERT_RE = re.compile(r'^Assert:\s', re.MULTILINE)
 
-    # ── 3. FPrime EVR with WARNING / ERROR / FATAL severity
+    # 3. FPrime EVR with WARNING / ERROR / FATAL severity
     #    FPrime log format: "EVENT: (seq) (time) SEVERITY: (component) EVR_NAME"
-    #    We match the severity field generically — works for every component.
+    #    We match the severity field generically works for every component.
     _FPRIME_FAULT_RE = re.compile(
         r"(WARNING_HI|WARNING_LO|ERROR|FATAL|ACTIVITY_HI.*fault"
         r"|HLTH_PING_WARN|HLTH_PING_LATE|HLTH_PING_WRONG_KEY)",
         re.IGNORECASE,
     )
 
-    # How long (seconds) without any EVENT: line before we declare the FS dead
-    LIVENESS_TIMEOUT_S: float = 2.0
+    # How long (seconds) without any EVENT: line before we declare the FS dead.
+    # In TCG Docker mode F' emits EVRs only at startup and on faults — not
+    # periodically in steady state.  Set the timeout larger than OBSERVATION_S
+    # (120s) so the liveness check does not fire mid-observation; the real
+    # liveness signal is the instruction-count oracle, not EVR frequency.
+    LIVENESS_TIMEOUT_S: float = 300.0
 
-    def __init__(self, pty_log_path: Path):
-        self.pty_log_path = pty_log_path
+    def __init__(self, pty_log_path: Union[Path, Tuple[str, int]],
+                 seek_to_end: bool = False):
+        """
+        Parameters
+        ----------
+        pty_log_path :
+            Either a ``Path`` to a local file/PTY to tail, or a ``(host, port)``
+            tuple to read the serial console from a TCP socket.  The TCP form is
+            used in Docker mode where the QEMU hvc0 console is exposed via
+            ``chardev socket,port=<N>,...`` in the NEST topology.
+        seek_to_end :
+            When True and using a file source, seek to the current end of the
+            file before reading.  Only new lines written after ``start()`` will
+            be buffered.  Useful when the file already contains a large boot log
+            and we only care about post-injection events.
+        """
+        if isinstance(pty_log_path, tuple):
+            self._tcp_source: Tuple[str, int] | None = pty_log_path
+            self.pty_log_path: Path | None = None
+        else:
+            self._tcp_source = None
+            self.pty_log_path = pty_log_path
+        self._seek_to_end = seek_to_end
         self._lines: list[str] = []
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -394,21 +630,60 @@ class PtyOracle:
             self._thread.join(timeout=2)
 
     def _tail(self) -> None:
-        try:
-            with self.pty_log_path.open("r", errors="replace") as f:
-                f.seek(0, 2)  # seek to end — only watch new lines
-                while not self._stop.is_set():
-                    line = f.readline()
-                    if line:
-                        stripped = line.rstrip()
-                        with self._lock:
-                            self._lines.append(stripped)
-                            if "EVENT:" in stripped:
-                                self._last_event_ts = time.monotonic()
-                    else:
-                        time.sleep(0.05)
-        except FileNotFoundError:
-            pass
+        if self._tcp_source is not None:
+            self._tail_tcp()
+        else:
+            self._tail_file()
+
+    def _tail_file(self) -> None:
+        while not self._stop.is_set():
+            try:
+                with self.pty_log_path.open("r", errors="replace") as f:  # type: ignore[union-attr]
+                    if self._seek_to_end:
+                        f.seek(0, 2)   # jump to end; only read new content
+                    while not self._stop.is_set():
+                        line = f.readline()
+                        if line:
+                            stripped = line.rstrip()
+                            with self._lock:
+                                self._lines.append(stripped)
+                                if "EVENT:" in stripped:
+                                    self._last_event_ts = time.monotonic()
+                        else:
+                            time.sleep(0.05)
+            except FileNotFoundError:
+                time.sleep(0.5)
+            except OSError:
+                time.sleep(0.5)
+
+    def _tail_tcp(self) -> None:
+        """Tail serial console output from a QEMU TCP chardev socket."""
+        host, port = self._tcp_source  # type: ignore[misc]
+        buf = b""
+        while not self._stop.is_set():
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.settimeout(5.0)
+                    s.connect((host, port))
+                    s.settimeout(0.5)
+                    buf = b""
+                    while not self._stop.is_set():
+                        try:
+                            chunk = s.recv(4096)
+                            if not chunk:
+                                break
+                            buf += chunk
+                            while b"\n" in buf:
+                                line_bytes, buf = buf.split(b"\n", 1)
+                                stripped = line_bytes.decode("utf-8", errors="replace").rstrip("\r")
+                                with self._lock:
+                                    self._lines.append(stripped)
+                                    if "EVENT:" in stripped:
+                                        self._last_event_ts = time.monotonic()
+                        except socket.timeout:
+                            continue
+            except (ConnectionRefusedError, OSError):
+                time.sleep(1.0)
 
     def recent_lines(self, n: int = 100) -> list[str]:
         with self._lock:
@@ -417,7 +692,7 @@ class PtyOracle:
     def drain(self) -> None:
         """Discard all accumulated log lines and reset the liveness clock.
         Call before scheduling each injection so classify() only sees events
-        that occurred AFTER this point — prevents stale events from a previous
+        that occurred AFTER this point prevents stale events from a previous
         injection bleeding into the next verdict."""
         with self._lock:
             self._lines.clear()
@@ -434,7 +709,7 @@ class PtyOracle:
             }
 
         ``evidence`` identifies the specific fault signal.
-        ``last_events`` shows the most recent FS telemetry — useful both as
+        ``last_events`` shows the most recent FS telemetry useful both as
         proof-of-life after MASKED and as last-known-good state before a crash.
         """
         deadline = time.monotonic() + observation_window_s
@@ -466,11 +741,14 @@ class PtyOracle:
                     if self._FPRIME_FAULT_RE.search(line):
                         detected = True; evidence = f"[EVR] {line}"
 
-            # Liveness check: FS silent for too long → crash/hang
+            if detected:
+                break
+
+            # Liveness check: FS silent for too long -> crash/hang
             if not crashed and last_event_age > self.LIVENESS_TIMEOUT_S:
                 crashed = True
                 evidence = (f"[liveness] No EVENT: line for "
-                            f"{last_event_age:.1f}s — FS appears dead")
+                            f"{last_event_age:.1f}s FS appears dead")
                 break
 
             if crashed:
@@ -484,29 +762,45 @@ class PtyOracle:
                 "last_events": last_events}
 
 
-# ── CHESS restart helper ──────────────────────────────────────────────────────
+# CHESS restart helper
 
-def restart_chess_in_qemu(pty_log: Path, timeout: float = 120.0) -> bool:
+def restart_chess_in_qemu(pty_log: Union[Optional[Path], Tuple[str, int]],
+                          timeout: float = 120.0) -> bool:
     """
     Restart CHESS inside the running QEMU VM via the PTY device.
+
+    In Docker mode (``pty_log`` is None or a TCP tuple), Phoenix handles restarts
+    autonomously this function is a no-op and returns True immediately.
 
     Writes a shell command to /tmp/qemu-serial-pty that kills any residual
     CHESS process and relaunches it.  Then calls PtyOracle._wait_for_chess
     (reimplemented inline) to confirm the binary is live.
 
     Safe for BSS-target injections (anonymous memory is fresh per process).
-    Text-segment injections corrupt the Linux page cache — the restarted
+    Text-segment injections corrupt the Linux page cache the restarted
     process loads the same corrupted page.
     """
-    import os, select as _select
+    if pty_log is None or isinstance(pty_log, tuple):
+        print("  Docker mode: Phoenix handles restart autonomously skipping PTY restart.",
+              flush=True)
+        return True
 
     CHESS_BINARY = "/CHESS/CHESS_Pathfinder0FS"
-    pty_dev = Path("/tmp/qemu-serial-pty")
+    if pty_log.suffix == ".out":
+        pty_dev = pty_log.with_suffix(".in")
+    else:
+        pty_dev = Path("/tmp/qemu-serial-pty")
+
+    # Record the size of the pty log before sending the restart command
+    # so we don't match keywords from the previous run.
+    start_offset = pty_log.stat().st_size if pty_log.exists() else 0
 
     try:
         with pty_dev.open("r+b", buffering=0) as pty:
-            pty.write(b"\n")        # wake shell
-            time.sleep(0.3)
+            pty.write(b"\x03\n")    # Ctrl-C to kill any running foreground process
+            time.sleep(0.5)
+            pty.write(b"root\n")    # log in if we are at getty prompt
+            time.sleep(0.5)
             pty.write(
                 f"killall {CHESS_BINARY.split('/')[-1]} 2>/dev/null; "
                 f"ulimit -c 0; {CHESS_BINARY} \n".encode()
@@ -517,17 +811,6 @@ def restart_chess_in_qemu(pty_log: Path, timeout: float = 120.0) -> bool:
               flush=True)
         return False
 
-    # Re-use the same keyword scan that PtyOracle uses
-    _READY_KEYWORDS = [
-        "CHESS_Pathfinder0FS",
-        "OpCodeRegistered",
-        "Starting HealthImpl",
-        "Registered with",
-        "all components ready",
-        "rate group",
-        "SENSOR_POLL_CYCLE",
-    ]
-
     print(f"  Waiting for CHESS ready (watching {pty_log})…", flush=True)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -535,13 +818,14 @@ def restart_chess_in_qemu(pty_log: Path, timeout: float = 120.0) -> bool:
             is_binary = pty_log.suffix != ".log"
             with pty_log.open("rb" if is_binary else "r",
                               **({} if is_binary else {"errors": "replace"})) as f:
+                f.seek(start_offset)
                 while time.monotonic() < deadline:
                     line = f.readline()
                     if not line:
                         time.sleep(0.1)
                         continue
                     decoded = line if isinstance(line, str) else line.decode(errors="replace")
-                    if any(kw in decoded for kw in _READY_KEYWORDS):
+                    if any(kw in decoded for kw in CHESS_READY_KEYWORDS):
                         print(f"  CHESS ready: {decoded.strip()}", flush=True)
                         return True
         except (FileNotFoundError, OSError):
@@ -550,26 +834,33 @@ def restart_chess_in_qemu(pty_log: Path, timeout: float = 120.0) -> bool:
     return False
 
 
-# ── Higher-level campaign runner ─────────────────────────────────────────────
+# Higher-level campaign runner
 
 @dataclass
 class CampaignConfig:
     socket_path: Path
     elf_path: Path
-    pty_log_path: Path
-    delay_insn: int          = 5_000_000   # instructions before each injection
+    pty_log_path: Union[Path, Tuple[str, int]]  # file path or (host, port) TCP
+    delay_insn: int          = 1_000_000   # instructions before each injection
     observation_window_s: float = 15.0     # seconds to wait for oracle verdict
     candidates_only: bool    = True        # only inject into FPrime variables
     filter_re: str | None    = None        # additional symbol name regex filter
     results_path: Path       = Path("/tmp/seu_results.jsonl")
+    db_path: Path | None     = None
+    # Docker/TCG mode: use instruction-count delta instead of serial EVENT: lines.
+    # MASKED = vCPU still advancing; CRASH = vCPU halted.
+    use_insn_count_liveness: bool = False
+    # GDB host/port for fallback write when plugin direct_write=NO (stripped QEMU).
+    gdb_host: str | None = None
+    gdb_port: int        = 1234
 
 
 class SEUCampaign:
     """
     Orchestrates a sequence of SEU injections:
 
-      1. Read ELF symbol table → build list of injection targets
-      2. For each target: schedule → wait for firing → classify outcome
+      1. Read ELF symbol table -> build list of injection targets
+      2. For each target: schedule -> wait for firing -> classify outcome
       3. Append result to JSONL file for analysis
 
     Phase 1 usage (a few manual targets):
@@ -588,8 +879,10 @@ class SEUCampaign:
     def __init__(self, cfg: CampaignConfig):
         self.cfg = cfg
         self._results: list[InjectionResult] = []
+        self._db = None
+        self._run_id = None
 
-    # ── Core injection loop ──────────────────────────────────────────────────
+    # Core injection loop
 
     def _run_one(self,
                  client: FaultInjectorClient,
@@ -601,9 +894,13 @@ class SEUCampaign:
         print(f"  Scheduled: addr=0x{spec.addr:08x} bit={spec.bit} "
               f"trigger_insn={trigger:,}")
 
-        # Wait for the injection to fire — pass trigger_insn to skip stale results
+        # Wait for the injection to fire.
+        # Timeout must cover the delay interval: CHESS sleeps between rate-group
+        # cycles so effective instruction rate can be ~1-2M insns/sec.
+        # Assume at least 300K insns/sec (very conservative) plus a 10s buffer.
+        fire_timeout = max(30.0, spec.delay / 300_000 + 10.0)
         plugin_resp = client.wait_for_result(
-            timeout=self.cfg.observation_window_s * 0.5,
+            timeout=fire_timeout,
             trigger_insn=trigger,
         )
         elapsed = time.monotonic() - t0
@@ -624,8 +921,28 @@ class SEUCampaign:
         original = int(plugin_resp.get("original", 0))
         flipped  = int(plugin_resp.get("flipped",  0))
 
+        # GDB fallback write when plugin direct_write=NO (stripped QEMU binary).
+        if not success and self.cfg.gdb_host and flipped != original:
+            try:
+                gdb = GdbMemWriter(host=self.cfg.gdb_host, port=self.cfg.gdb_port)
+                success = gdb.write_byte(spec.addr, flipped)
+            except Exception:
+                pass
+
         # Classify FPrime's response
-        verdict = oracle.classify(self.cfg.observation_window_s * 0.5)
+        if self.cfg.use_insn_count_liveness:
+            count_before = client.get_count()
+            time.sleep(self.cfg.observation_window_s)
+            count_after  = client.get_count()
+            delta = count_after - count_before
+            alive = delta > 1_000_000
+            verdict = {
+                "outcome":     "MASKED" if alive else "CRASH",
+                "evidence":    f"insn delta={delta:,} ({'alive' if alive else 'halted'})",
+                "last_events": [],
+            }
+        else:
+            verdict = oracle.classify(self.cfg.observation_window_s * 0.5)
 
         result = InjectionResult(
             spec=spec,
@@ -638,7 +955,7 @@ class SEUCampaign:
         )
         return result
 
-    # ── Public API ───────────────────────────────────────────────────────────
+    # Public API
 
     def run_targets(self, specs: Iterable[InjectionSpec],
                     reset_between: bool = True) -> list[InjectionResult]:
@@ -657,16 +974,19 @@ class SEUCampaign:
         try:
             with FaultInjectorClient(self.cfg.socket_path) as client:
                 for i, spec in enumerate(specs):
-                    # Drain oracle before each injection — only fresh events count
+                    # Drain oracle before each injection only fresh events count
                     oracle.drain()
 
-                    print(f"\n[{i+1}/{len(specs)}] addr=0x{spec.addr:08x} "
+                    sym_info = ""
+                    if spec.symbol:
+                        sym_info = f" ({spec.symbol} + {spec.byte_offset})"
+                    print(f"\n[{i+1}/{len(specs)}] addr=0x{spec.addr:08x}{sym_info} "
                           f" bit={spec.bit}  delay={spec.delay:,} insns")
 
                     result = self._run_one(client, oracle, spec)
                     results.append(result)
                     self._append_result(result)
-                    print(f"  → {result.summary()}")
+                    print(f"  -> {result.summary()}")
 
                     # Restart CHESS for independence (skip after last injection)
                     if reset_between and i < len(specs) - 1:
@@ -709,13 +1029,24 @@ class SEUCampaign:
         print(f"Sweep: {len(targets)} bit-flip targets in ELF "
               f"({'candidates only' if self.cfg.candidates_only else 'all symbols'})")
 
+        if self.cfg.db_path:
+            from nest_client.seu.result_db import SEUResultDB
+            self._db = SEUResultDB(self.cfg.db_path)
+            self._run_id = self._db.start_run(
+                elf_path=self.cfg.elf_path,
+                topology="sweep",
+                notes="automated sweep",
+            )
+
         if max_targets:
             targets = targets[:max_targets]
             print(f"  (limited to first {max_targets})")
 
         specs = [
             InjectionSpec(addr=t["addr"], bit=t["bit"],
-                          delay=self.cfg.delay_insn)
+                          delay=self.cfg.delay_insn,
+                          symbol=t.get("symbol", ""),
+                          byte_offset=t.get("byte_offset", 0))
             for t in targets
         ]
         results = self.run_targets(specs)
@@ -724,13 +1055,21 @@ class SEUCampaign:
             for r in results:
                 on_result(r)
 
+        if self._db and self._run_id:
+            self._db.print_run_summary(self._run_id)
+            items = self._db.compare(self._run_id)
+            self._db.print_review_queue(items)
+            self._db.close()
+
         return results
 
-    # ── Result persistence ───────────────────────────────────────────────────
+    # Result persistence
 
     def _append_result(self, result: InjectionResult) -> None:
         record = {
             "addr":         f"0x{result.spec.addr:08x}",
+            "symbol":       result.spec.symbol,
+            "byte_offset":  result.spec.byte_offset,
             "bit":          result.spec.bit,
             "trigger_insn": result.trigger_insn,
             "success":      result.success,
@@ -741,6 +1080,20 @@ class SEUCampaign:
         }
         with self.cfg.results_path.open("a") as f:
             f.write(json.dumps(record) + "\n")
+            
+        if self._db and self._run_id:
+            self._db.record(
+                run_id=self._run_id,
+                addr=result.spec.addr,
+                bit=result.spec.bit,
+                original=result.original,
+                flipped=result.flipped,
+                write_ok=result.success,
+                outcome=result.outcome,
+                evidence=getattr(result, "evidence", ""),
+                insn_count=result.trigger_insn,
+                elf_path=self.cfg.elf_path,
+            )
 
     def print_summary(self) -> None:
         from collections import Counter
@@ -755,7 +1108,7 @@ class SEUCampaign:
         print("─────────────────────────────────────────────────────")
 
 
-# ── CLI: quick manual injection ───────────────────────────────────────────────
+# CLI: quick manual injection
 
 def _cli() -> None:
     import argparse
