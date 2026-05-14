@@ -11,7 +11,7 @@ from typing import DefaultDict, List
 
 from nest_client.client import AsyncNestClient, NestClient
 from nest_client.config import DEFAULT_URL
-from nest_client.mutators.descriptor_runner import run_descriptor_file
+from nest_client.mutators.descriptor_runner import load_descriptor, run_descriptor_file
 from nest_client.scenario import Scenario, ValidationResult
 from nest_client.sequence import Event
 from nest_client.time import s
@@ -301,16 +301,54 @@ def run_scenario(args):
 
 
 def run_mutator(args):
-    scenario, results, url, scenario_seed, artifacts_dir = run_descriptor_file(args.descriptor, args.url)
+    descriptor = load_descriptor(args.descriptor, args.url)
 
-    print(f"Running scenario {scenario.name}")
-    print(f"Descriptor: {args.descriptor}")
-    print(f"Server URL: {url}")
-    if scenario_seed is not None:
-        print(f"Mutation seed (scenario + topology): {scenario_seed}")
-    print(f"Saved run artifacts to: {artifacts_dir}")
+    if descriptor.remote is not None:
+        _run_mutator_remote(args, descriptor)
+    else:
+        _run_mutator_local(args)
 
+
+def _run_mutator_local(args):
+    from pathlib import Path as _Path
+    from nest_client.remote.dashboard import RunDashboard
+
+    descriptor_name = _Path(args.descriptor).name
+    with RunDashboard(1, title=descriptor_name) as dashboard:
+        scenario, results, url, scenario_seed, artifacts_dir = run_descriptor_file(
+            args.descriptor, args.url, dashboard=dashboard
+        )
+
+    print(f"Artifacts: {artifacts_dir}")
     print_validation_report(scenario, results)
+
+
+def _run_mutator_remote(args, descriptor):
+    from pathlib import Path
+    from nest_client.remote.parallel_runner import run_parallel_remote
+    from nest_client.remote.dashboard import RunDashboard
+
+    descriptor_path = Path(args.descriptor).resolve()
+    n = descriptor.run.n_instances
+
+    print(f"Remote: {descriptor.remote.host}  |  {n} instance(s)  |  image: {descriptor.remote.image}")
+    print()
+
+    with RunDashboard(n, title=f"{descriptor.remote.host} ({n} instances)") as dashboard:
+        parallel_results = run_parallel_remote(
+            descriptor, descriptor.remote, descriptor_path, dashboard=dashboard
+        )
+
+    if parallel_results:
+        print(f"Artifacts: {parallel_results[0].run_dir.parent}")
+    for result in parallel_results:
+        n_pass = sum(r.success for r in result.results)
+        n_fail = len(result.results) - n_pass
+        status = green("SUCCESS") if n_fail == 0 else red("FAILED")
+        print(
+            f"  instance-{result.instance_index}  |  seed {result.seed}  |  "
+            f"{status} ({n_pass}/{len(result.results)} passed)"
+        )
 
 
 

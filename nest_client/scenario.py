@@ -37,6 +37,7 @@ class Scenario:
         mutation_seed: int = 0,
         mutation_output_dir: Path | None = None,
         topology_mutation_transform: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        on_server_message: Callable[[dict], None] | None = None,
     ):
         self.name = name
         self.topology_file = topology_file
@@ -46,10 +47,12 @@ class Scenario:
         self.mutation_seed = mutation_seed
         self.mutation_output_dir = mutation_output_dir
         self.topology_mutation_transform = topology_mutation_transform
+        self.on_server_message = on_server_message
 
         self._events: List[dict] = []
         self._errors: List[dict] = []
         self._start_time: float | None = None
+        self.on_simulation_started: Callable | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -72,6 +75,8 @@ class Scenario:
 
         try:
             await self._start_simulation(client)
+            if self.on_simulation_started is not None:
+                self.on_simulation_started()
             await self._execute_sequence(client)
             results = await self._validate_events()
         finally:
@@ -161,15 +166,19 @@ class Scenario:
     # ------------------------------------------------------------------
 
     async def _on_message(self, msg: dict):
+        if self.on_server_message is not None:
+            self.on_server_message(msg)
+
         msg_type = msg.get("type")
 
         if msg_type == "event":
             self._events.append(msg)
-            logger.info(f"Received event: {msg}")
+            logger.debug("Received event: %s", msg)
 
         elif msg_type == "error":
             self._errors.append(msg)
-            raise RuntimeError(f"Simulation error: {msg}")
+            # Don't raise: called as a fire-and-forget task; error is already
+            # captured in _errors and forwarded via on_server_message callback.
 
     # ------------------------------------------------------------------
     # Sequence Execution
@@ -203,7 +212,7 @@ class Scenario:
         await self._execute_op(op, client)
 
     async def _execute_op(self, op: SequenceOp, client: AsyncNestClient):
-        logger.info(op)
+        logger.debug("%s", op)
         item = op.item
 
         try:

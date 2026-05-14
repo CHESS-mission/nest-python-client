@@ -1,0 +1,31 @@
+run:
+  seed: 42
+  artifacts_dir: mutations
+  n_instances: 3
+
+scenario:
+  script: demo.py
+  name: demo
+  region: Transceiver
+  start_probability: 0.0
+  stop_probability: 0.0
+
+protocol:
+  kind: chips
+  spec: protocols/chips.yaml
+
+fuzz:
+  chips:
+    mode: typed
+    fields: [seq, command, payload]
+    payload_mode: bitflip
+    flip_prob: 0.20
+    max_flips: 2
+    payload_flip_prob: 0.10
+    max_payload_flips: 4
+    max_payload_extend: 16
+
+remote:
+  host: spacecraftteampc1.epfl.ch
+  user: qsandoz
+  ssh_key: ~/.ssh/id_ed25519_EST

@@ -36,8 +36,8 @@ def temperature_ramp(from_: float, to: float, over: Time):
 def init():
     with timeline() as t:
         # Let VMs boot
-        t[25 * s] = check_qemu("CPU_A")
-        t[25 * s] = check_qemu("CPU_B")
+        t[30 * s] = check_qemu("CPU_A")
+        t[30 * s] = check_qemu("CPU_B")
 
 
 @sequence

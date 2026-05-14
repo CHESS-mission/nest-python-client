@@ -26,11 +26,11 @@ components:
         - option: M
           value: virt
         - option: kernel
-          value: ./image-demo-CPU_A/zImage 
+          value: ./images/twocan/zImage_demo_A
         - option: append
           value: rootwait root=/dev/vda console=hvc0
         - option: drive
-          value: if=none,file=./image-demo-CPU_A/disk.qcow2,id=hd0 
+          value: if=none,file=./images/twocan/disk_demo_A.qcow2,id=hd0 
         - option: device
           value: virtio-blk-device,drive=hd0 
         - option: nographic 
@@ -39,7 +39,7 @@ components:
         - option: device
           value: virtio-serial
         - option: chardev
-          value: pty,path=/tmp/qemu-serial-pty-CPU_A,id=char0
+          value: socket,port=3001,host=0.0.0.0,id=char0,server=on,wait=off
         - option: device
           value: virtconsole,chardev=char0
       i2c_timeout_ms: 10
@@ -65,11 +65,11 @@ components:
         - option: M
           value: virt
         - option: kernel
-          value: ./image-demo-CPU_B/zImage 
+          value: ./images/twocan/zImage_demo_B
         - option: append
           value: rootwait root=/dev/vda console=hvc0
         - option: drive
-          value: if=none,file=./image-demo-CPU_B/disk.qcow2,id=hd0 
+          value: if=none,file=./images/twocan/disk_demo_B.qcow2,id=hd0 
         - option: device
           value: virtio-blk-device,drive=hd0 
         - option: nographic 
@@ -78,7 +78,7 @@ components:
         - option: device
           value: virtio-serial
         - option: chardev
-          value: pty,path=/tmp/qemu-serial-pty-CPU_B,id=char0
+          value: socket,port=3002,host=0.0.0.0,id=char0,server=on,wait=off
         - option: device
           value: virtconsole,chardev=char0
       i2c_timeout_ms: 10
@@ -150,7 +150,7 @@ components:
   - name: Transceiver
     type: wasm
     config:
-      module: components/transceiver.wasm
+      module: components/demo_transceiver.wasm
     ports:
       system:
         - name: uart

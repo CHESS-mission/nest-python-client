@@ -15,6 +15,7 @@ from typing import Any
 import yaml
 
 from nest_client.client import AsyncNestClient
+from nest_client.remote.config import RemoteConfig, parse_remote_config
 from nest_client.scenario import Scenario, ValidationResult
 from nest_client.sequence import Command, Event, SetEnv
 from nest_client.time import s
@@ -27,6 +28,31 @@ from nest_client.mutators.topology_mutator import TopologyMutator
 
 
 logger = logging.getLogger(__name__)
+
+_LOG_FORMATTER = logging.Formatter(
+    "[%(asctime)s] %(levelname)s %(name)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
+
+
+def _attach_run_log_handler(run_dir: Path) -> logging.FileHandler:
+    """
+    Attach a FileHandler to the root logger that writes to run_dir/run.log.
+    A thread-ID filter is applied so parallel instances don't cross-contaminate.
+    Returns the handler so the caller can remove it when the run finishes.
+    """
+    import threading
+    tid = threading.get_ident()
+    handler = logging.FileHandler(run_dir / "run.log", encoding="utf-8")
+    handler.setFormatter(_LOG_FORMATTER)
+    handler.addFilter(lambda record: threading.get_ident() == tid)
+    logging.getLogger().addHandler(handler)
+    return handler
+
+
+def _detach_run_log_handler(handler: logging.FileHandler) -> None:
+    logging.getLogger().removeHandler(handler)
+    handler.close()
 
 
 @dataclass
@@ -49,6 +75,7 @@ class DescriptorRunConfig:
     url: str
     artifacts_dir: Path
     seed: int | None = None
+    n_instances: int = 1
 
 
 @dataclass
@@ -80,6 +107,7 @@ class MutationDescriptor:
     run: DescriptorRunConfig
     protocol: DescriptorProtocolConfig | None = None
     fuzz: DescriptorFuzzConfig | None = None
+    remote: RemoteConfig | None = None
 
 
 def _parse_protocol_config(raw: Any, base_dir: Path) -> DescriptorProtocolConfig | None:
@@ -361,6 +389,10 @@ def _parse_descriptor(data: dict[str, Any], base_dir: Path, default_url: str) ->
     if run_seed is not None and not isinstance(run_seed, int):
         raise ValueError("descriptor.run.seed must be an integer or null")
 
+    n_instances = run_data.get("n_instances", 1)
+    if not isinstance(n_instances, int) or n_instances < 1:
+        raise ValueError("descriptor.run.n_instances must be a positive integer")
+
     protocol_config = _parse_protocol_config(data.get("protocol"), base_dir)
     fuzz_config = _parse_fuzz_config(data.get("fuzz"))
 
@@ -370,11 +402,14 @@ def _parse_descriptor(data: dict[str, Any], base_dir: Path, default_url: str) ->
                 "descriptor.fuzz.chips.mode='typed' requires descriptor.protocol.kind='chips'"
             )
 
+    remote_config = parse_remote_config(data.get("remote"))
+
     return MutationDescriptor(
         scenario=scenario_config,
-        run=DescriptorRunConfig(url=run_url, artifacts_dir=artifacts_dir, seed=run_seed),
+        run=DescriptorRunConfig(url=run_url, artifacts_dir=artifacts_dir, seed=run_seed, n_instances=n_instances),
         protocol=protocol_config,
         fuzz=fuzz_config,
+        remote=remote_config,
     )
 
 
@@ -788,9 +823,64 @@ def _write_run_artifacts(
     )
     
 
+def _write_validation_report(
+    run_dir: Path,
+    scenario: Scenario,
+    results: list[ValidationResult],
+) -> None:
+    REPORT_WIDTH = 80
+    lines: list[str] = []
+    lines.append(f"Scenario: {scenario.name}")
+    lines.append("")
+
+    total_pass = 0
+    from collections import defaultdict as _defaultdict
+    scope_groups: dict = _defaultdict(list)
+
+    for result in results:
+        path = tuple(scope.label or "" for scope in result.op.scope_stack)
+        scope_groups[path].append(result)
+
+    for path in sorted(scope_groups.keys()):
+        scope_results = scope_groups[path]
+        scope = scope_results[0].op.scope_stack[-1]
+        path_string = " / ".join(label for label in path if label != "")
+
+        lines.append("─" * REPORT_WIDTH)
+        scope_window = f"[{scope.start.as_unit(s)}s -> {scope.end.as_unit(s)}s]"
+        lines.append(f"{path_string:<{REPORT_WIDTH - len(scope_window) - 1}} {scope_window}")
+        lines.append("─" * REPORT_WIDTH)
+        lines.append("")
+
+        for result in scope_results:
+            event = result.op.item
+            assert isinstance(event, Event)
+            expect = "EXPECT" if event.expect else "FORBID"
+            symbol = "OK" if result.success else "FAILED"
+            window_start = result.op.offset.as_unit(s)
+            window_end = (
+                result.op.offset + event.within if event.within else scope.end
+            ).as_unit(s)
+            lines.append(f"  [{symbol}] {expect} {event.component}.{event.name} [{window_start}s -> {window_end}s]")
+            total_pass += result.success
+
+        lines.append("")
+
+    total_fail = len(results) - total_pass
+    lines.append("─" * REPORT_WIDTH)
+    lines.append("Summary:")
+    lines.append(f"  {total_pass} passed")
+    lines.append(f"  {total_fail} failed")
+    lines.append("")
+    lines.append("Result: " + ("SUCCESS" if total_fail == 0 else "FAILED"))
+
+    (run_dir / "report.txt").write_text("\n".join(lines), encoding="utf-8")
+
+
 def run_descriptor_file(
     descriptor_path: str | Path,
     default_url: str,
+    dashboard=None,
 ) -> tuple[Scenario, list[ValidationResult], str, int | None, Path]:
     resolved_descriptor_path = Path(descriptor_path).resolve()
     descriptor = load_descriptor(resolved_descriptor_path, default_url)
@@ -798,19 +888,49 @@ def run_descriptor_file(
 
     run_dir = _new_run_artifact_dir(descriptor.run.artifacts_dir, scenario.name)
 
-    scenario.persist_mutated_topology = True
-    scenario.mutation_output_dir = run_dir
-        
-    _write_run_artifacts(
-        run_dir,
-        resolved_descriptor_path,
-        descriptor,
-        scenario,
-        scenario_seed,
-        selection_summary,
-    )
+    log_handler = _attach_run_log_handler(run_dir)
+    server_log = open(run_dir / "server.log", "w", encoding="utf-8")
+    try:
+        scenario.persist_mutated_topology = True
+        scenario.mutation_output_dir = run_dir
 
-    client = AsyncNestClient(descriptor.run.url)
-    results = scenario.run(client)
+        def _on_server_msg(msg: dict) -> None:
+            server_log.write(json.dumps(msg) + "\n")
+            server_log.flush()
+            if dashboard is not None:
+                dashboard.on_server_msg(0, msg)
+
+        scenario.on_server_message = _on_server_msg
+
+        _write_run_artifacts(
+            run_dir,
+            resolved_descriptor_path,
+            descriptor,
+            scenario,
+            scenario_seed,
+            selection_summary,
+        )
+
+        if dashboard is not None:
+            from nest_client.remote.dashboard import Phase
+            dashboard.update(0, Phase.RUNNING)
+
+        client = AsyncNestClient(descriptor.run.url)
+        try:
+            results = scenario.run(client)
+        except Exception as exc:
+            if dashboard is not None:
+                from nest_client.remote.dashboard import Phase
+                dashboard.update(0, Phase.FAILED, error_msg=str(exc))
+            raise
+
+        if dashboard is not None:
+            from nest_client.remote.dashboard import Phase
+            n_pass = sum(r.success for r in results)
+            n_fail = len(results) - n_pass
+            dashboard.update(0, Phase.DONE, passed=n_pass, failed=n_fail)
+    finally:
+        _detach_run_log_handler(log_handler)
+        server_log.close()
 
     return scenario, results, descriptor.run.url, scenario_seed, run_dir

@@ -86,12 +86,12 @@ class AsyncNestClient:
     # ------------------------------------------------------------------
     async def connect(self) -> None:
         """Connect to the NEST WebSocket server."""
-        logger.info("Connecting to NEST at %s", self.url)
+        logger.debug("Connecting to NEST at %s", self.url)
         try:
             self.ws = await connect(self.url)  # type: ignore[attr-defined]
             self._connected.set()
             self._recv_task = asyncio.create_task(self._recv_loop(), name="nest_recv")
-            logger.info("Connected.")
+            logger.debug("Connected.")
         except Exception as e:
             raise NestError(f"Failed to connect: {e}") from e
 
@@ -100,7 +100,7 @@ class AsyncNestClient:
         """Disconnect cleanly from the server."""
         if not self.ws:
             return
-        logger.info("Disconnecting from NEST.")
+        logger.debug("Disconnecting from NEST.")
         if self._recv_task:
             self._recv_task.cancel()
             try:
@@ -112,7 +112,7 @@ class AsyncNestClient:
         finally:
             self.ws = None
             self._connected.clear()
-        logger.info("Disconnected.")
+        logger.debug("Disconnected.")
 
     # ------------------------------------------------------------------
     # Dispatcher / Listener API
@@ -296,7 +296,7 @@ class AsyncNestClient:
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            logger.exception("Receive loop error: %s", e)
+            logger.debug("Receive loop ended: %s", e)
 
     async def next_message(self, timeout: Optional[float] = None) -> Dict[str, Any]:
         """Return the next message from the server, or raise on timeout."""
