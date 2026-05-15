@@ -630,32 +630,30 @@ def print_json(symbols: list[SymbolInfo], candidates_only: bool = False) -> str:
 
 # Candidate export (used by fault_injector.py)
 
-def get_stratified_sample(elf_path: Path,
+def get_bituniform_sample(elf_path: Path,
                           n: int,
                           rng,
                           candidates_only: bool = True,
                           vtable_skip: int = 64,
                           ) -> list[dict]:
     """
-    Return n injection targets sampled **uniformly across symbols** (not bytes).
+    Return n targets sampled uniformly per bit — probability proportional to
+    injectable bytes (size - vtable_skip).
 
-    Each candidate symbol gets equal probability of being picked regardless of
-    its size.  For each selected symbol a random byte offset and bit are chosen.
-    This prevents large buffers (cmdSeq 4 KB, tlmSend 580 KB) from drowning out
-    small but safety-critical objects (rateGroupDriver 736 B, mallocator 4 B).
-
-    vtable_skip : skip the first N bytes of each object (vtable pointer region).
+    This matches the physical radiation model: a cosmic ray is equally likely
+    to strike any bit in RAM, so larger structures are proportionally more
+    likely to be hit.  Use this for statistical sweep campaigns.
     """
     symbols = [s for s in analyze_cached(elf_path)
-               if (not candidates_only or s.is_candidate) and s.size > 0]
+               if (not candidates_only or s.is_candidate) and s.size > vtable_skip]
     if not symbols:
         return []
 
+    weights = [s.size - vtable_skip for s in symbols]
     targets = []
     for _ in range(n):
-        sym = rng.choice(symbols)
-        skip = min(vtable_skip, sym.size - 1)
-        byte_off = rng.randint(skip, sym.size - 1)
+        sym = rng.choices(symbols, weights=weights, k=1)[0]
+        byte_off = rng.randint(vtable_skip, sym.size - 1)
         bit = rng.randint(0, 7)
         targets.append({
             "addr":        sym.address + byte_off,
@@ -664,6 +662,157 @@ def get_stratified_sample(elf_path: Path,
             "byte_offset": byte_off,
         })
     return targets
+
+
+def get_stable_component_sample(
+    elf_path: Path,
+    total_quota: int,
+    seed: int = 42,
+    filter_prefix: str = "CHESS::",
+    vtable_skip: int = 64,
+    min_per_component: int = 1,
+    exclude_re: str | None = None,
+) -> tuple[list[dict], dict[str, int]]:
+    """
+    Physically proportional, version-stable CI sample.
+
+    total_quota injections are distributed across components proportionally by
+    injectable bytes (larger components get more samples, matching the radiation
+    model within each component's footprint).  Every component gets at least
+    min_per_component injections.
+
+    Targets are keyed by (symbol_name, field_name, bit_within_field) — the same
+    stable key that SEUResultDB uses for cross-version comparison.  If BSS
+    addresses shift between FS versions, the same logical target resolves to the
+    correct new address automatically.  New fields added in a newer version
+    produce new targets; removed fields simply disappear.
+
+    Randomisation uses SHA-256(seed:symbol:field:slot) so results are fully
+    reproducible without relying on Python's PRNG state or address layout.
+
+    Returns:
+        targets    : list of injection dicts, each carrying "stable_key", "field",
+                     "component", "byte_offset" in addition to "addr", "bit", "symbol"
+        comp_quotas: {comp_name: quota} for display / auditing
+    """
+    import hashlib as _hl
+
+    def _pick(salt: str, n: int) -> int:
+        """Deterministic pick in [0, n) keyed by salt."""
+        return int(_hl.sha256(salt.encode()).hexdigest(), 16) % n
+
+    # All CHESS:: data symbols
+    symbols = [
+        s for s in analyze_cached(elf_path)
+        if s.demangled.startswith(filter_prefix)
+        and s.size > 0
+        and s.section in (".bss", ".data")
+    ]
+    if not symbols:
+        return [], {}
+
+    # Group by component (first identifier after filter_prefix)
+    comp_syms: dict[str, list] = {}
+    for sym in symbols:
+        remainder = sym.demangled[len(filter_prefix):]
+        comp = re.split(r"[<:]", remainder)[0]
+        if comp:
+            comp_syms.setdefault(comp, []).append(sym)
+
+    # Resolve DWARF fields for all symbols at once (one DWARF parse)
+    all_fields = expand_symbol_fields(elf_path, symbols)  # sym.name -> [FieldInfo]
+
+    # Build per-component list of injectable "units":
+    # (sym, field_name_or_None, field_byte_offset, field_size_bytes)
+    # field_byte_offset is relative to sym.address.
+    comp_units: dict[str, list[tuple]] = {}
+    for comp, syms in comp_syms.items():
+        units: list[tuple] = []
+        for sym in syms:
+            fields = all_fields.get(sym.name, [])
+            inject_start = min(vtable_skip, sym.size)
+            if fields:
+                for fi in fields:
+                    if fi.is_base or fi.size == 0:
+                        continue
+                    if fi.offset + fi.size <= inject_start:
+                        continue
+                    units.append((sym, fi.field_name, fi.offset, fi.size))
+            else:
+                # No DWARF: whole injectable range is one anonymous unit
+                injectable = sym.size - inject_start
+                if injectable > 0:
+                    units.append((sym, None, inject_start, injectable))
+        if units:
+            comp_units[comp] = units
+
+    if not comp_units:
+        return [], {}
+
+    # Apply component exclusion filter
+    if exclude_re:
+        _excl = re.compile(exclude_re, re.IGNORECASE)
+        comp_units = {c: u for c, u in comp_units.items()
+                      if not _excl.search(c)}
+    if not comp_units:
+        return [], {}
+
+    # Injectable bytes per component (for quota distribution)
+    comp_bytes = {c: sum(u[3] for u in us) for c, us in comp_units.items()}
+    total_bytes = sum(comp_bytes.values())
+    n_comps = len(comp_units)
+
+    # Distribute total_quota proportionally; guaranteed floor per component
+    guaranteed = n_comps * min_per_component
+    extra_pool = max(0, total_quota - guaranteed)
+    comp_quotas: dict[str, int] = {}
+    for comp in sorted(comp_units):
+        frac = comp_bytes[comp] / total_bytes if total_bytes else 1 / n_comps
+        comp_quotas[comp] = min_per_component + round(extra_pool * frac)
+
+    # Correct rounding drift so sum == total_quota
+    delta = total_quota - sum(comp_quotas.values())
+    if delta != 0:
+        anchor = max(comp_quotas, key=lambda c: comp_bytes[c])
+        comp_quotas[anchor] = max(min_per_component, comp_quotas[anchor] + delta)
+
+    # Generate stable targets
+    targets: list[dict] = []
+    for comp in sorted(comp_units):
+        units = sorted(comp_units[comp],
+                       key=lambda u: (u[0].name, u[1] or ""))  # stable order
+        unit_weights = [u[3] for u in units]
+        cum_weights = []
+        acc = 0
+        for w in unit_weights:
+            acc += w
+            cum_weights.append(acc)
+        total_w = cum_weights[-1]
+
+        for slot in range(comp_quotas[comp]):
+            # Pick unit proportionally by size using stable hash
+            unit_pick = _pick(f"{seed}:{comp}:unit:{slot}", total_w)
+            unit = next(u for u, c in zip(units, cum_weights) if unit_pick < c)
+            sym, field_name, field_offset, field_size = unit
+
+            # Pick bit within field using stable hash
+            bit_in_field = _pick(f"{seed}:{sym.demangled}:{field_name or ''}:{slot}",
+                                 field_size * 8)
+            byte_in_field = bit_in_field // 8
+            bit = bit_in_field % 8
+            addr = sym.address + field_offset + byte_in_field
+
+            targets.append({
+                "addr":        addr,
+                "bit":         bit,
+                "symbol":      sym.demangled,
+                "field":       field_name,
+                "byte_offset": field_offset + byte_in_field,
+                "component":   comp,
+                "stable_key":  f"{sym.demangled}::{field_name or ''}::{bit_in_field}",
+            })
+
+    return targets, comp_quotas
 
 
 def summarise_candidates(elf_path: Path, candidates_only: bool = True) -> list[dict]:

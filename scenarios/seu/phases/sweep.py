@@ -62,10 +62,10 @@ def run_automated_sweep(args) -> None:
 
     if getattr(args, "random", False):
         import random as _rnd
-        from nest_client.seu.elf_analyzer import get_stratified_sample
+        from nest_client.seu.elf_analyzer import get_bituniform_sample
 
         rng    = _rnd.Random(args.seed)
-        sample = get_stratified_sample(
+        sample = get_bituniform_sample(
             ELF_PATH, n=args.max_targets, rng=rng,
             candidates_only=not args.all_symbols,
         )

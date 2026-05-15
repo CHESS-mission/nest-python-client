@@ -43,7 +43,9 @@ from seu.phases.detected import run_detected_phase
 from seu.phases.hard_crash import run_hard_crash_phase
 from seu.phases.kernel_crash import run_kernel_crash_phase
 from seu.phases.sweep import run_automated_sweep
+from seu.phases.ci import run_ci
 from seu.phases.interactive import run_interactive
+from seu.phases.state_machine import run_state_machine
 
 
 def main() -> None:
@@ -51,7 +53,9 @@ def main() -> None:
     parser.add_argument("--manual",       action="store_true",
                         help="Phase 1: run the hand-crafted MANUAL_TARGETS list")
     parser.add_argument("--sweep",        action="store_true",
-                        help="Phase 2: automated ELF sweep")
+                        help="Phase 2: automated ELF sweep (size-proportional random)")
+    parser.add_argument("--ci",           action="store_true",
+                        help="CI regression check: fixed quota per CHESS:: component")
     parser.add_argument("--interactive",  action="store_true",
                         help="Interactive mode (type inject commands)")
     parser.add_argument("--hard-crash",   action="store_true",
@@ -62,6 +66,8 @@ def main() -> None:
                         help="Demo: cycleCount injection -> DETECTED (F' logs WARNING)")
     parser.add_argument("--redundant",    action="store_true",
                         help="Redundant topology: watch CPU_B for M4/Mux switchover after CRASH")
+    parser.add_argument("--state-machine", action="store_true",
+                        help="Pairwise invariant: inject into EventAction m_state (32 bit flips)")
 
     parser.add_argument("--delay",       type=int,   default=1_000_000,
                         help="Instructions before each injection (default 1M)")
@@ -70,18 +76,31 @@ def main() -> None:
     parser.add_argument("--all-symbols", action="store_true",
                         help="Sweep all symbols, not just FPrime candidates")
     parser.add_argument("--filter",      metavar="REGEX",
-                        help="Only inject into symbols matching this regex")
+                        help="Only inject into symbols matching this regex (sweep only)")
     parser.add_argument("--max-targets", type=int,   default=20,
                         help="Number of sweep targets (default 20)")
     parser.add_argument("--random",      action="store_true",
-                        help="Pick sweep targets randomly instead of sequentially")
+                        help="Pick sweep targets randomly (size-proportional) instead of sequentially")
     parser.add_argument("--seed",        type=int,   default=42,
-                        help="Random seed for --random (default 42)")
+                        help="Random seed for --random / --ci (default 42)")
+
+    # CI-specific options
+    parser.add_argument("--quota",     type=int,   default=60,
+                        help="--ci: total injections distributed proportionally across components (default 60)")
+    parser.add_argument("--threshold", type=float, default=0.10,
+                        help="--ci: masked-rate increase that triggers failure (default 0.10)")
+    parser.add_argument("--baseline",  metavar="RUN_ID",
+                        help="--ci: DB run_id (or prefix) to compare against")
+    parser.add_argument("--ci-filter", metavar="PREFIX", default="CHESS::",
+                        help="--ci: symbol prefix to include (default CHESS::)")
+    parser.add_argument("--ci-exclude", metavar="REGEX", default=None,
+                        help="--ci: exclude component names matching this regex")
 
     args = parser.parse_args()
 
-    if not any([args.manual, args.sweep, args.interactive,
-                args.hard_crash, args.kernel_crash, args.detected]):
+    if not any([args.manual, args.sweep, args.ci, args.interactive,
+                args.hard_crash, args.kernel_crash, args.detected,
+                args.redundant, args.state_machine]):
         args.manual = True
 
     # Pre-connect to the CHESS console when using a TCP chardev (simple topology).
@@ -128,6 +147,10 @@ def main() -> None:
             _console_oracle.stop()
     elif args.sweep:
         run_automated_sweep(args)
+    elif args.ci:
+        run_ci(args)
+    elif args.state_machine:
+        run_state_machine(args)
     else:
         run_manual_phase(args)
 

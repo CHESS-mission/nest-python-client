@@ -354,6 +354,7 @@ class InjectionSpec:
     delay: int = 5_000_000 # instructions from *now* to inject
     symbol: str = ""       # demangled symbol name (optional)
     byte_offset: int = 0   # byte offset within the symbol
+    field_name: str = ""   # DWARF field name within the symbol (optional)
 
 
 @dataclass
@@ -364,17 +365,29 @@ class InjectionResult:
     original: int          # original byte value
     flipped: int           # byte value after flip
     elapsed_s: float       # wall time between schedule and confirm
-    outcome: str = "unknown"  # set by oracle: CRASH / DETECTED / MASKED / BENIGN
+    outcome: str        = "unknown"  # CRASH / DETECTED / MASKED
+    evidence: str       = ""         # specific line that triggered the verdict
+    last_events: list   = None       # last FPrime EVENT: lines seen (proof of life)
+    recovery_path: str  = ""         # FS_RESTART | OS_REBOOT | "" (for CRASH only)
+    recovery_time_s: float = None    # seconds from crash to CHESS ready
+
+    def __post_init__(self):
+        if self.last_events is None:
+            self.last_events = []
 
     def summary(self) -> str:
         sym_info = ""
-        if self.spec.symbol:
+        if self.spec.field_name:
+            sym_info = f" ({self.spec.symbol} :: {self.spec.field_name})"
+        elif self.spec.symbol:
             sym_info = f" ({self.spec.symbol} + {self.spec.byte_offset})"
+        rec = f"  [{self.recovery_path} {self.recovery_time_s:.0f}s]" \
+              if self.recovery_path and self.recovery_time_s is not None else ""
         return (
             f"addr=0x{self.spec.addr:08x}{sym_info} bit={self.spec.bit} "
             f"0x{self.original:02x}->0x{self.flipped:02x} "
             f"ok={self.success} insn={self.trigger_insn:,} "
-            f"outcome={self.outcome}"
+            f"outcome={self.outcome}{rec}"
         )
 
 
@@ -569,15 +582,33 @@ class PtyOracle:
         re.IGNORECASE,
     )
 
-    # 2. FPrime process-level abort (FW_ASSERT prints "Assert: <file>:<line>")
-    _FPRIME_ASSERT_RE = re.compile(r'^Assert:\s', re.MULTILINE)
+    # 2. FPrime process-level abort.
+    # FW_ASSERT writes "Assert: <file>:<line>" to the serial console.
+    # AssertFatalAdapter also logs the file path to the serial console, so we
+    # match both its known format and the short "Assert:" prefix.
+    _FPRIME_ASSERT_RE = re.compile(
+        r'(^Assert:\s|AssertFatalAdapter)',
+        re.MULTILINE,
+    )
 
-    # 3. FPrime EVR with WARNING / ERROR / FATAL severity
+    # 3. FPrime EVR with WARNING / ERROR / FATAL severity.
     #    FPrime log format: "EVENT: (seq) (time) SEVERITY: (component) EVR_NAME"
-    #    We match the severity field generically works for every component.
+    #    Only match inside actual EVENT: lines to avoid false positives from
+    #    file paths (e.g. AssertFatalAdapter/AssertFatal**Adapter**.cpp contains
+    #    the word "Fatal" but is a crash signal, not a health-monitoring event).
     _FPRIME_FAULT_RE = re.compile(
-        r"(WARNING_HI|WARNING_LO|ERROR|FATAL|ACTIVITY_HI.*fault"
-        r"|HLTH_PING_WARN|HLTH_PING_LATE|HLTH_PING_WRONG_KEY)",
+        r"EVENT:.*\b(WARNING_HI|WARNING_LO|FATAL"
+        r"|HLTH_PING_WARN|HLTH_PING_LATE|HLTH_PING_WRONG_KEY)\b",
+        re.IGNORECASE,
+    )
+
+    # Known background noise — events that fire in normal simulation operation
+    # regardless of injections.  Matching these should NOT trigger DETECTED.
+    # comQueue QueueOverflow: telemetry downlink queue fills when no real ground
+    # station is connected.  This is an infrastructure condition, not a fault
+    # response.
+    _BACKGROUND_NOISE_RE = re.compile(
+        r"comQueue.*(?:QueueOverflow|Overflow)|QueueOverflow.*comQueue",
         re.IGNORECASE,
     )
 
@@ -738,7 +769,8 @@ class PtyOracle:
                         crashed = True; evidence = f"[Assert] {line}"
 
                 if not detected and not crashed:
-                    if self._FPRIME_FAULT_RE.search(line):
+                    if (self._FPRIME_FAULT_RE.search(line)
+                            and not self._BACKGROUND_NOISE_RE.search(line)):
                         detected = True; evidence = f"[EVR] {line}"
 
             if detected:
@@ -882,6 +914,18 @@ class SEUCampaign:
         self._db = None
         self._run_id = None
 
+    def start_db_run(self, topology: str = "sweep", notes: str = "") -> str:
+        """Open the DB and create a run record. Returns the run_id.
+        Enables per-result DB writes in both run_targets() and run_sweep()."""
+        if not self.cfg.db_path:
+            return ""
+        from nest_client.seu.result_db import SEUResultDB
+        self._db = SEUResultDB(self.cfg.db_path)
+        self._run_id = self._db.start_run(
+            elf_path=self.cfg.elf_path, topology=topology, notes=notes,
+        )
+        return self._run_id
+
     # Core injection loop
 
     def _run_one(self,
@@ -929,7 +973,17 @@ class SEUCampaign:
             except Exception:
                 pass
 
-        # Classify FPrime's response
+        # Drain background events that accumulated during the injection delay.
+        # Any WARNING/ERROR that fired before the bit flip is pre-injection noise
+        # (e.g. comQueue overflow from normal telemetry load) and must not be
+        # counted as evidence of detection.
+        oracle.drain()
+
+        # Classify FPrime's response.
+        # Always run the event oracle to catch DETECTED (WARNING/ERROR/FATAL
+        # EVENT: lines).  Supplement with a fast instruction-count crash check:
+        # if the vCPU stops advancing within 2 s of injection, that is a CRASH —
+        # no need to wait out the full observation window.
         if self.cfg.use_insn_count_liveness:
             count_before = client.get_count()
             time.sleep(self.cfg.observation_window_s)
@@ -942,7 +996,23 @@ class SEUCampaign:
                 "last_events": [],
             }
         else:
-            verdict = oracle.classify(self.cfg.observation_window_s * 0.5)
+            # Fast crash pre-check: 2 s instruction-count sample.
+            # If the vCPU already halted we know the outcome immediately.
+            _c0 = client.get_count()
+            time.sleep(2.0)
+            _c1 = client.get_count()
+            if (_c1 - _c0) < 500_000:
+                verdict = {
+                    "outcome":  "CRASH",
+                    "evidence": f"insn delta={_c1-_c0:,} over 2s — vCPU halted",
+                    "last_events": [],
+                }
+            else:
+                # vCPU alive — run the event oracle for the full half-window.
+                # The 2 s crash check runs in parallel conceptually; do NOT
+                # subtract it from the oracle budget so health-monitoring events
+                # have enough time to fire (FPrime needs ~10 s).
+                verdict = oracle.classify(self.cfg.observation_window_s * 0.5)
 
         result = InjectionResult(
             spec=spec,
@@ -952,6 +1022,8 @@ class SEUCampaign:
             flipped=flipped,
             elapsed_s=elapsed,
             outcome=verdict["outcome"],
+            evidence=verdict.get("evidence", ""),
+            last_events=verdict.get("last_events", []),
         )
         return result
 
@@ -971,37 +1043,108 @@ class SEUCampaign:
 
         specs = list(specs)
         results = []
+        # FPrime-level boot keywords (excludes Phoenix script echoes which fire
+        # before FPrime initialises and would give a false "ready" signal).
+        _FPRIME_BOOT_KW = [kw for kw in CHESS_READY_KEYWORDS
+                           if kw != "CHESS_Pathfinder0FS"]
+        # Phoenix restart / OS reboot signals for recovery_path classification.
+        _FS_RESTART_RE  = re.compile(r"running\s+(stable|target|:)\s*/root/bin/")
+        _OS_REBOOT_RE   = re.compile(r"Kernel panic|Oops:|BUG: Bad page",
+                                     re.IGNORECASE)
+
         try:
             with FaultInjectorClient(self.cfg.socket_path) as client:
                 for i, spec in enumerate(specs):
-                    # Drain oracle before each injection only fresh events count
                     oracle.drain()
 
-                    sym_info = ""
-                    if spec.symbol:
-                        sym_info = f" ({spec.symbol} + {spec.byte_offset})"
-                    print(f"\n[{i+1}/{len(specs)}] addr=0x{spec.addr:08x}{sym_info} "
-                          f" bit={spec.bit}  delay={spec.delay:,} insns")
+                    # Formatted header line: show field name when available
+                    _loc = (f"{spec.symbol} :: {spec.field_name}"
+                            if spec.field_name else
+                            (f"{spec.symbol} + {spec.byte_offset}"
+                             if spec.symbol else f"0x{spec.addr:08x}"))
+                    print(f"\n[{i+1}/{len(specs)}] {_loc}  "
+                          f"addr=0x{spec.addr:08x}  bit={spec.bit}  "
+                          f"delay={spec.delay:,} insns")
 
                     result = self._run_one(client, oracle, spec)
                     results.append(result)
-                    self._append_result(result)
-                    print(f"  -> {result.summary()}")
+                    print(f"  -> {result.summary()}", flush=True)
 
-                    # Restart CHESS for independence (skip after last injection)
-                    if reset_between and i < len(specs) - 1:
-                        print("  Resetting CHESS for next injection…", flush=True)
-                        restarted = restart_chess_in_qemu(
-                            self.cfg.pty_log_path, timeout=120.0)
-                        if not restarted:
-                            print("  WARNING: FS did not restart; continuing.",
-                                  flush=True)
-                        # Drain boot messages so they don't count as evidence
+                    # Show proof-of-life for MASKED (last EVENT: lines oracle saw)
+                    if result.outcome == "MASKED" and result.last_events:
+                        for ev in result.last_events[-2:]:
+                            print(f"  oracle: {ev[:100]}", flush=True)
+
+                    is_last = (i >= len(specs) - 1)
+
+                    if result.outcome == "MASKED" and result.success:
+                        # Restore the flipped byte so each injection is independent.
+                        if self.cfg.gdb_host and not is_last:
+                            try:
+                                _gdb_r = GdbMemWriter(host=self.cfg.gdb_host,
+                                                      port=self.cfg.gdb_port)
+                                _ok = _gdb_r.write_byte(spec.addr, result.original)
+                                print(f"  Restored 0x{result.flipped:02x}->"
+                                      f"0x{result.original:02x} at "
+                                      f"0x{spec.addr:08x}  "
+                                      f"({'ok' if _ok else 'FAILED — next injection not independent'})",
+                                      flush=True)
+                            except Exception as _e:
+                                print(f"  WARNING: GDB restore failed ({_e})",
+                                      flush=True)
                         oracle.drain()
-                    elif result.outcome == "CRASH" and not reset_between:
-                        restarted = restart_chess_in_qemu(
-                            self.cfg.pty_log_path, timeout=120.0)
+                        self._append_result(result)
+
+                    elif reset_between and not is_last:
+                        # CRASH or DETECTED: wait for FPrime to restart, and
+                        # classify the recovery path while waiting (zero extra time).
+                        print("  Waiting for CHESS ready…", flush=True)
+                        _t_crash = time.monotonic()
+                        # For DETECTED the FS is still running — no restart occurred.
+                        _rpath = "" if result.outcome == "CRASH" else "NONE"
+                        _ready = ""
+                        _deadline = _t_crash + 120.0
+
+                        _boot_oracle = PtyOracle(self.cfg.pty_log_path,
+                                                 seek_to_end=True)
+                        _boot_oracle.start()
+                        try:
+                            while time.monotonic() < _deadline:
+                                for line in _boot_oracle.recent_lines(500):
+                                    if not _rpath:
+                                        if _OS_REBOOT_RE.search(line):
+                                            _rpath = "OS_REBOOT"
+                                        elif _FS_RESTART_RE.search(line):
+                                            _rpath = "FS_RESTART"
+                                    if any(kw in line for kw in _FPRIME_BOOT_KW):
+                                        _ready = line.strip()
+                                        break
+                                if _ready:
+                                    break
+                                time.sleep(1.0)
+                        finally:
+                            _boot_oracle.stop()
+
+                        _rtime = time.monotonic() - _t_crash
+                        result.recovery_path   = _rpath or "UNKNOWN"
+                        result.recovery_time_s = round(_rtime, 1)
+
+                        if _ready:
+                            print(f"  CHESS ready ({result.recovery_path} "
+                                  f"{result.recovery_time_s:.0f}s): "
+                                  f"{_ready[:70]}", flush=True)
+                        else:
+                            last = _boot_oracle.recent_lines(3)
+                            print(f"  WARNING: CHESS ready timeout "
+                                  f"({result.recovery_path}, "
+                                  f"{result.recovery_time_s:.0f}s). "
+                                  f"Last: {last}", flush=True)
                         oracle.drain()
+                        self._append_result(result)
+
+                    else:
+                        self._append_result(result)
+
         finally:
             oracle.stop()
 
@@ -1067,20 +1210,24 @@ class SEUCampaign:
 
     def _append_result(self, result: InjectionResult) -> None:
         record = {
-            "addr":         f"0x{result.spec.addr:08x}",
-            "symbol":       result.spec.symbol,
-            "byte_offset":  result.spec.byte_offset,
-            "bit":          result.spec.bit,
-            "trigger_insn": result.trigger_insn,
-            "success":      result.success,
-            "original":     f"0x{result.original:02x}",
-            "flipped":      f"0x{result.flipped:02x}",
-            "elapsed_s":    round(result.elapsed_s, 3),
-            "outcome":      result.outcome,
+            "addr":            f"0x{result.spec.addr:08x}",
+            "symbol":          result.spec.symbol,
+            "field_name":      result.spec.field_name,
+            "byte_offset":     result.spec.byte_offset,
+            "bit":             result.spec.bit,
+            "trigger_insn":    result.trigger_insn,
+            "success":         result.success,
+            "original":        f"0x{result.original:02x}",
+            "flipped":         f"0x{result.flipped:02x}",
+            "elapsed_s":       round(result.elapsed_s, 3),
+            "outcome":         result.outcome,
+            "evidence":        result.evidence,
+            "recovery_path":   result.recovery_path,
+            "recovery_time_s": result.recovery_time_s,
         }
         with self.cfg.results_path.open("a") as f:
             f.write(json.dumps(record) + "\n")
-            
+
         if self._db and self._run_id:
             self._db.record(
                 run_id=self._run_id,
@@ -1090,9 +1237,11 @@ class SEUCampaign:
                 flipped=result.flipped,
                 write_ok=result.success,
                 outcome=result.outcome,
-                evidence=getattr(result, "evidence", ""),
+                evidence=result.evidence,
                 insn_count=result.trigger_insn,
                 elf_path=self.cfg.elf_path,
+                recovery_path=result.recovery_path,
+                recovery_time_s=result.recovery_time_s,
             )
 
     def print_summary(self) -> None:

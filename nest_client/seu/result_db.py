@@ -46,9 +46,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import uuid
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -87,7 +89,9 @@ CREATE TABLE IF NOT EXISTS results (
     outcome           TEXT    NOT NULL,
     evidence          TEXT,
     insn_count        INTEGER,
-    elapsed_s         REAL
+    elapsed_s         REAL,
+    recovery_path     TEXT,
+    recovery_time_s   REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_results_key
@@ -242,19 +246,25 @@ class ReviewItem:
 
     @property
     def is_regression(self) -> bool:
-        """True if a previously-MASKED target now produces a worse outcome."""
-        return self.outcome_a == "MASKED" and self.outcome_b != "MASKED"
+        """True when a fault that was previously visible (DETECTED or CRASH)
+        is now MASKED — the FS fails silently.  This is the worst-case outcome
+        for a health-monitoring regression."""
+        return self.outcome_b == "MASKED" and self.outcome_a != "MASKED"
 
     @property
     def is_improvement(self) -> bool:
-        return self.outcome_a != "MASKED" and self.outcome_b == "MASKED"
+        """True when a previously-silent fault is now caught:
+        MASKED -> DETECTED (health monitoring added coverage) or
+        CRASH -> DETECTED (FS now handles the fault gracefully)."""
+        return (self.outcome_a == "MASKED" and self.outcome_b == "DETECTED") or \
+               (self.outcome_a == "CRASH"  and self.outcome_b == "DETECTED")
 
     @property
     def severity(self) -> str:
         """For sorting: REGRESSION > NEW_CRASH > CHANGED > IMPROVEMENT."""
         if self.is_regression:
             return "REGRESSION"
-        if self.outcome_b == "CRASH" and self.outcome_a != "CRASH":
+        if self.outcome_a == "MASKED" and self.outcome_b == "CRASH":
             return "NEW_CRASH"
         if self.is_improvement:
             return "IMPROVEMENT"
@@ -285,6 +295,18 @@ class SEUResultDB:
         self._con = sqlite3.connect(str(self.db_path))
         self._con.row_factory = sqlite3.Row
         self._con.executescript(_DDL)
+        # Migrate existing DBs that lack newer columns (ALTER TABLE is idempotent
+        # via the try/except — sqlite3 raises OperationalError if column exists).
+        for col, typedef in [
+            ("recovery_path",   "TEXT    DEFAULT ''"),
+            ("recovery_time_s", "REAL"),
+        ]:
+            try:
+                self._con.execute(
+                    f"ALTER TABLE results ADD COLUMN {col} {typedef}"
+                )
+            except Exception:
+                pass  # column already exists
         self._con.commit()
         self._enrichers: dict[str, AddressEnricher] = {}
 
@@ -393,6 +415,8 @@ class SEUResultDB:
         insn_count: int | None = None,
         elapsed_s: float | None = None,
         elf_path: Path | None = None,
+        recovery_path: str | None = None,
+        recovery_time_s: float | None = None,
     ) -> None:
         """
         Store one injection result.  If elf_path is provided the address is
@@ -414,8 +438,8 @@ class SEUResultDB:
                (run_id, addr, bit, byte_offset, symbol_name, field_name,
                 field_offset, field_bit_offset, section,
                 original, flipped, write_ok, outcome, evidence,
-                insn_count, elapsed_s)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                insn_count, elapsed_s, recovery_path, recovery_time_s)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 run_id, addr, bit,
                 info.byte_offset if info else None,
@@ -426,6 +450,7 @@ class SEUResultDB:
                 info.section if info else None,
                 original, flipped, int(write_ok), outcome,
                 evidence or "", insn_count, elapsed_s,
+                recovery_path or "", recovery_time_s,
             ),
         )
         self._con.commit()
@@ -611,15 +636,14 @@ class SEUResultDB:
             # -> "QueueOverflow (comQueue)"
             # "[OS] Segmentation fault (core dumped)"
             # -> "Segmentation fault"
-            import re as _re
             ev_short = ev
             if "[EVR]" in ev:
-                m = _re.search(
+                m = re.search(
                     r'(?:WARNING_HI|FATAL|ACTIVITY_HI|ACTIVITY_LO|COMMAND_HI|COMMAND_LO)'
                     r':\s+\(([^)]+)\)\s+(\S+)',
                     ev
                 )
-                if m:
+                if m:  # noqa: E741 (shadowing outer `m` from masked_rate loop)
                     ev_short = f"{m.group(2)} ({m.group(1)})"
                 else:
                     # Fallback: everything after last ") "
@@ -643,7 +667,6 @@ class SEUResultDB:
 
         # Totals
         total = len(detail)
-        from collections import Counter
         counts = Counter(r["outcome"] for r in detail)
         print(f"  {'─'*10}  {'─':>1}  {'─'*19}  {'─'*6}  {'─'*44}  {'─'*10}  {'─'*40}")
         print(f"  {'OUTCOME':<12}  {'N':>5}  {'%':>6}")
@@ -671,6 +694,104 @@ class SEUResultDB:
             for row in rows:
                 f.write(json.dumps(dict(row)) + "\n")
         return len(rows)
+
+
+    def masked_rate_by_component(
+        self,
+        run_id: str,
+        filter_prefix: str = "CHESS::",
+    ) -> dict[str, dict]:
+        """
+        Return per-component MASKED rate for the given run.
+
+        Only includes symbols whose demangled name starts with filter_prefix
+        (default "CHESS::") to focus on application code and exclude
+        FPrime framework internals (Svc::, Fw::).
+
+        Returns a dict keyed by symbol_name:
+            {
+              "masked_rate":    float,   # fraction of injections that went undetected
+              "detected_rate":  float,   # fraction caught by health monitoring
+              "crash_rate":     float,
+              "total":          int,
+              "counts":         {"MASKED": N, "DETECTED": N, "CRASH": N, ...},
+            }
+        """
+        meta = self.get_run(run_id)
+        if meta is None:
+            raise ValueError(f"Run not found: '{run_id}'")
+        run_id = meta["run_id"]
+
+        rows = self._con.execute(
+            "SELECT symbol_name, outcome FROM results "
+            "WHERE run_id = ? AND symbol_name LIKE ?",
+            (run_id, filter_prefix + "%"),
+        ).fetchall()
+
+        per_sym: dict[str, Counter] = defaultdict(Counter)
+        for r in rows:
+            per_sym[r["symbol_name"]][r["outcome"]] += 1
+
+        result: dict[str, dict] = {}
+        for sym, counts in sorted(per_sym.items()):
+            total = sum(counts.values())
+            if total == 0:
+                continue
+            result[sym] = {
+                "masked_rate":   counts["MASKED"]   / total,
+                "detected_rate": counts["DETECTED"] / total,
+                "crash_rate":    counts["CRASH"]    / total,
+                "total":         total,
+                "counts":        dict(counts),
+            }
+        return result
+
+    def print_masked_rates(
+        self,
+        run_id: str,
+        compare_run_id: str | None = None,
+        filter_prefix: str = "CHESS::",
+    ) -> None:
+        """
+        Print per-component MASKED rate table.  If compare_run_id is given,
+        show the delta and flag increases in MASKED rate as regressions.
+        """
+        rates_b = self.masked_rate_by_component(run_id, filter_prefix)
+        rates_a = (self.masked_rate_by_component(compare_run_id, filter_prefix)
+                   if compare_run_id else {})
+
+        meta_b = self.get_run(run_id)
+        label_b = (meta_b["fs_git_hash"] or meta_b["binary_hash"][:8]) if meta_b else run_id[:8]
+
+        print(f"\n  MASKED rate by component  (filter: {filter_prefix}*)")
+        if compare_run_id:
+            meta_a = self.get_run(compare_run_id)
+            label_a = (meta_a["fs_git_hash"] or meta_a["binary_hash"][:8]) if meta_a else compare_run_id[:8]
+            print(f"  Baseline : {label_a}   Current : {label_b}")
+            print(f"  {'COMPONENT':<45}  {'BASE':>6}  {'NOW':>6}  {'DELTA':>7}  FLAG")
+            print(f"  {'─'*45}  {'─'*6}  {'─'*6}  {'─'*7}  {'─'*12}")
+        else:
+            print(f"  Run: {label_b}")
+            print(f"  {'COMPONENT':<45}  {'MASKED':>6}  {'DETECT':>6}  {'TOTAL':>6}")
+            print(f"  {'─'*45}  {'─'*6}  {'─'*6}  {'─'*6}")
+
+        for sym, r in rates_b.items():
+            name = sym.split("::")[-1] if "::" in sym else sym
+            name = name[:45]
+            m = r["masked_rate"]
+            if compare_run_id:
+                base = rates_a.get(sym, {}).get("masked_rate")
+                delta = (m - base) if base is not None else None
+                base_s = f"{base*100:5.1f}%" if base is not None else "  n/a "
+                delta_s = f"{delta*100:+6.1f}%" if delta is not None else "      "
+                flag = ""
+                if delta is not None and delta > 0.05:
+                    flag = "\033[91m⚠ REGRESSION\033[0m"
+                elif delta is not None and delta < -0.05:
+                    flag = "\033[92m✓ improved\033[0m"
+                print(f"  {name:<45}  {base_s}  {m*100:5.1f}%  {delta_s}  {flag}")
+            else:
+                print(f"  {name:<45}  {m*100:5.1f}%  {r['detected_rate']*100:5.1f}%  {r['total']:6d}")
 
 
 # CLI
@@ -702,6 +823,13 @@ def _cli():
 
     p_del = sub.add_parser("delete", help="Delete a run and all its results")
     p_del.add_argument("run_id", help="Full UUID or unambiguous prefix")
+
+    p_rates = sub.add_parser("rates", help="Per-component MASKED rate for a run")
+    p_rates.add_argument("run_id")
+    p_rates.add_argument("--compare", metavar="RUN_B", default=None,
+                         help="Baseline run to diff against")
+    p_rates.add_argument("--filter", metavar="PREFIX", default="CHESS::",
+                         help="Symbol prefix filter (default: CHESS::)")
 
     args = parser.parse_args()
     if not args.cmd:
@@ -736,6 +864,9 @@ def _cli():
         elif args.cmd == "delete":
             n = db.delete_run(args.run_id)
             print(f"Deleted run {args.run_id} ({n} results removed)")
+
+        elif args.cmd == "rates":
+            db.print_masked_rates(args.run_id, args.compare, args.filter)
 
 
 if __name__ == "__main__":
