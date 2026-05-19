@@ -23,7 +23,7 @@ def init():
 
 @sequence
 def check_temperature_sanity(cpu_id: int, duration: Time):
-    """Forbid any Transceiver packet carrying a temperature outside the valid range.
+    """Over `duration`, forbid out-of-range temperature packets and require at least one valid one.
 
     Good FS (with sanity check): fuzzer noise filtered before reaching Transceiver -> passes.
     Buggy FS (no sanity check): garbage temperatures forwarded to Transceiver -> FORBID fires.
@@ -36,16 +36,16 @@ def check_temperature_sanity(cpu_id: int, duration: Time):
                     data['temperature'] > TEMP_VALID_MAX
                 )
             )) \
-            .forbid()
+            .forbid(within=duration)
         t[0 * s] = event("Transceiver", "packet_received") \
             .where(lambda data: (
                 data['cpu_id'] == cpu_id and
                 TEMP_VALID_MIN <= data['temperature'] <= TEMP_VALID_MAX
             )) \
-            .expect(within=10 * s)
+            .expect(within=duration)
 
 
 @scenario(topology_file="./demo.yaml")
 def fuzzing_regression():
     with timeline() as t:
-        t[0 * s] = init() >> check_temperature_sanity(0, 30 * s)
+        t[0 * s] = init() >> check_temperature_sanity(0, 20 * s)
