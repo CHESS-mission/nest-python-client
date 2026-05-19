@@ -1,0 +1,10 @@
+run:
+  url: ws://localhost:3000/ws
+  artifacts_dir: mutations
+
+scenario:
+  script: fuzzing_regression.py
+  name: fuzzing_regression
+  region: PCT2075_0    # activates Fuzzer_Mux_PCT2075_0 — the sensor whose value[0] feeds the Transceiver packet
+  start_probability: 1.0  # always start fuzzing
+  stop_probability: 0.0   # never stop
