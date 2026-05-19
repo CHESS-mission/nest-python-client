@@ -1,10 +1,20 @@
 run:
-  url: ws://localhost:3000/ws
+  seed: 42
   artifacts_dir: mutations
+  n_instances: 3
 
 scenario:
   script: fuzzing_regression.py
   name: fuzzing_regression
   region: PCT2075_0    # activates Fuzzer_Mux_PCT2075_0 — the sensor whose value[0] feeds the Transceiver packet
-  start_probability: 1.0  # always start fuzzing
+  start_probability: 1.0  # always start fuzzing at first timeline step
   stop_probability: 0.0   # never stop
+
+fuzz:
+  i2c_payload:
+    mode: random      # replace the 2 PCT2075 response bytes with random data
+
+remote:
+  host: spacecraftteampc1.epfl.ch
+  user: qsandoz
+  ssh_key: ~/.ssh/id_ed25519_EST

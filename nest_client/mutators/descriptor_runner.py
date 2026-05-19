@@ -97,8 +97,14 @@ class DescriptorChipsFuzzConfig:
 
 
 @dataclass
+class DescriptorI2cPayloadFuzzConfig:
+    mode: str = "random"
+
+
+@dataclass
 class DescriptorFuzzConfig:
     chips: DescriptorChipsFuzzConfig | None = None
+    i2c_payload: DescriptorI2cPayloadFuzzConfig | None = None
 
 
 @dataclass
@@ -139,9 +145,11 @@ def _parse_fuzz_config(raw: Any) -> DescriptorFuzzConfig | None:
     if not isinstance(raw, dict):
         raise ValueError("descriptor.fuzz must be a mapping")
 
+    i2c_payload_cfg = _parse_i2c_payload_fuzz_config(raw.get("i2c_payload"))
+
     chips_data = raw.get("chips")
     if chips_data is None:
-        return DescriptorFuzzConfig(chips=None)
+        return DescriptorFuzzConfig(chips=None, i2c_payload=i2c_payload_cfg)
     if not isinstance(chips_data, dict):
         raise ValueError("descriptor.fuzz.chips must be a mapping")
 
@@ -181,7 +189,21 @@ def _parse_fuzz_config(raw: Any) -> DescriptorFuzzConfig | None:
         max_payload_flips=int(chips_data.get("max_payload_flips", 4)),
         max_payload_extend=int(chips_data.get("max_payload_extend", 16)),
     )
-    return DescriptorFuzzConfig(chips=chips)
+    return DescriptorFuzzConfig(chips=chips, i2c_payload=i2c_payload_cfg)
+
+
+def _parse_i2c_payload_fuzz_config(raw: Any) -> DescriptorI2cPayloadFuzzConfig | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("descriptor.fuzz.i2c_payload must be a mapping")
+
+    mode = str(raw.get("mode", "random")).strip().lower()
+    if mode not in {"random", "boundary", "truncate", "extend"}:
+        raise ValueError(
+            "descriptor.fuzz.i2c_payload.mode must be one of random, boundary, truncate, extend"
+        )
+    return DescriptorI2cPayloadFuzzConfig(mode=mode)
 
 
 def _normalize_chips_payload_types(raw: Any, *, context: str) -> dict[str, str]:
@@ -637,6 +659,12 @@ def _build_scenario(descriptor: MutationDescriptor) -> tuple[Scenario, int | Non
     )
 
     strategy_by_target: dict[tuple[str, str], dict[str, Any]] = {}
+    if descriptor.fuzz is not None and descriptor.fuzz.i2c_payload is not None:
+        i2c_cfg = descriptor.fuzz.i2c_payload
+        i2c_strategy = {"type": "i2c_payload", "mode": i2c_cfg.mode}
+        for target in targets:
+            strategy_by_target[(target.component, target.group)] = i2c_strategy
+
     if descriptor.fuzz is not None and descriptor.fuzz.chips is not None:
         protocol_payload_types: dict[str, dict[str, str]] = {}
         if descriptor.fuzz.chips.mode == "typed":
@@ -779,18 +807,29 @@ def _write_run_artifacts(
         ),
         "fuzz": (
             {
-                "chips": {
-                    "mode": descriptor.fuzz.chips.mode,
-                    "fields": descriptor.fuzz.chips.fields,
-                    "payload_mode": descriptor.fuzz.chips.payload_mode,
-                    "flip_prob": descriptor.fuzz.chips.flip_prob,
-                    "max_flips": descriptor.fuzz.chips.max_flips,
-                    "payload_flip_prob": descriptor.fuzz.chips.payload_flip_prob,
-                    "max_payload_flips": descriptor.fuzz.chips.max_payload_flips,
-                    "max_payload_extend": descriptor.fuzz.chips.max_payload_extend,
-                }
+                **(
+                    {
+                        "chips": {
+                            "mode": descriptor.fuzz.chips.mode,
+                            "fields": descriptor.fuzz.chips.fields,
+                            "payload_mode": descriptor.fuzz.chips.payload_mode,
+                            "flip_prob": descriptor.fuzz.chips.flip_prob,
+                            "max_flips": descriptor.fuzz.chips.max_flips,
+                            "payload_flip_prob": descriptor.fuzz.chips.payload_flip_prob,
+                            "max_payload_flips": descriptor.fuzz.chips.max_payload_flips,
+                            "max_payload_extend": descriptor.fuzz.chips.max_payload_extend,
+                        }
+                    }
+                    if descriptor.fuzz.chips is not None
+                    else {}
+                ),
+                **(
+                    {"i2c_payload": {"mode": descriptor.fuzz.i2c_payload.mode}}
+                    if descriptor.fuzz.i2c_payload is not None
+                    else {}
+                ),
             }
-            if descriptor.fuzz is not None and descriptor.fuzz.chips is not None
+            if descriptor.fuzz is not None
             else None
         ),
         "scenario": {
