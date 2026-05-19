@@ -26,11 +26,11 @@ components:
         - option: M
           value: virt
         - option: kernel
-          value: ./images/twocan/zImage_demo_A
+          value: ./images/twocan/zImage #./images/twocan/zImage_demo_A
         - option: append
-          value: rootwait root=/dev/vda console=hvc0
+          value: rootwait root=/dev/vda console=hvc0 chess_cpu_id=0
         - option: drive
-          value: if=none,file=./images/twocan/disk_demo_A.qcow2,id=hd0 
+          value: if=none,file=./images/twocan/disk_A.qcow2,id=hd0  #file=./images/twocan/disk_demo_A.qcow2,id=hd0 
         - option: device
           value: virtio-blk-device,drive=hd0 
         - option: nographic 
@@ -65,11 +65,11 @@ components:
         - option: M
           value: virt
         - option: kernel
-          value: ./images/twocan/zImage_demo_B
+          value: ./images/twocan/zImage #./images/twocan/zImage_demo_B
         - option: append
-          value: rootwait root=/dev/vda console=hvc0
+          value: rootwait root=/dev/vda console=hvc0 chess_cpu_id=1
         - option: drive
-          value: if=none,file=./images/twocan/disk_demo_B.qcow2,id=hd0 
+          value: if=none,file=./images/twocan/disk_B.qcow2,id=hd0  #file=./images/twocan/disk_demo_B.qcow2,id=hd0 
         - option: device
           value: virtio-blk-device,drive=hd0 
         - option: nographic 
