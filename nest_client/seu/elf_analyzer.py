@@ -223,14 +223,38 @@ def _addr_from_location(attr) -> int | None:
     return None
 
 
+# Module-level field-layout cache: keyed by resolved ELF path.
+# Maps path -> {symbol_mangled_name: [FieldInfo]}.
+# Populated on first call to expand_symbol_fields for a given ELF; subsequent
+# calls for any symbol from that ELF hit the cache and skip DWARF parsing.
+_field_cache: dict[str, dict[str, list[FieldInfo]]] = {}
+
+
 def expand_symbol_fields(elf_path: Path,
                           symbols: list[SymbolInfo]) -> dict[str, list[FieldInfo]]:
     """
     For each SymbolInfo, parse DWARF to get member field layout.
     Matches by DW_AT_linkage_name (mangled name) first, then falls back to address.
     Returns {symbol.name: [FieldInfo, ...]}.
+
+    The full DWARF index is built once per ELF path per session and cached
+    in memory, so repeated calls (e.g. once per component in a sweep) only
+    parse DWARF on the first invocation.
     """
     results: dict[str, list[FieldInfo]] = {}
+    cache_key = str(elf_path.resolve())
+    per_elf   = _field_cache.get(cache_key)
+
+    # Fast path: all requested symbols already in the session cache.
+    if per_elf is not None:
+        for s in symbols:
+            if s.name in per_elf:
+                results[s.name] = per_elf[s.name]
+        # Return cached results for all known symbols.
+        # Unknown symbols fall through to a full DWARF parse (rare: new ELF).
+        if all(s.name in results for s in symbols):
+            return results
+
     with elf_path.open('rb') as f:
         elf = ELFFile(f)
         if not elf.has_dwarf_info():
@@ -239,7 +263,8 @@ def expand_symbol_fields(elf_path: Path,
             return results
 
         dwarf = elf.get_dwarf_info()
-        print("Building DWARF index (may take a few seconds)…", file=sys.stderr)
+        if per_elf is None:
+            print("Building DWARF index (may take a few seconds)…", file=sys.stderr)
         die_index = _build_die_index(dwarf)
 
         # Build forward-declaration -> full-definition map.
@@ -325,6 +350,12 @@ def expand_symbol_fields(elf_path: Path,
                     fields = _collect_fields(type_die, die_index, fwd_map=fwd_map)
                     if fields:
                         results[sym.name] = fields
+
+    # Store all resolved fields into the session cache for this ELF.
+    if results:
+        if cache_key not in _field_cache:
+            _field_cache[cache_key] = {}
+        _field_cache[cache_key].update(results)
 
     return results
 
@@ -672,6 +703,7 @@ def get_stable_component_sample(
     vtable_skip: int = 64,
     min_per_component: int = 1,
     exclude_re: str | None = None,
+    stable_elf_path: Path | None = None,
 ) -> tuple[list[dict], dict[str, int]]:
     """
     Physically proportional, version-stable CI sample.
@@ -690,6 +722,15 @@ def get_stable_component_sample(
     Randomisation uses SHA-256(seed:symbol:field:slot) so results are fully
     reproducible without relying on Python's PRNG state or address layout.
 
+    Address resolution
+    ------------------
+    When *stable_elf_path* is provided, symbol *addresses* come from the stable
+    (release) ELF — the binary that actually runs in QEMU — while symbol
+    *fields and sizes* still come from the debug ELF's DWARF (the release
+    binary is stripped).  Without this remapping, debug and release binaries
+    have divergent BSS layouts and injections land in unrelated memory
+    (writes verify OK, but target nothing CHESS reads), yielding 100% MASKED.
+
     Returns:
         targets    : list of injection dicts, each carrying "stable_key", "field",
                      "component", "byte_offset" in addition to "addr", "bit", "symbol"
@@ -701,7 +742,7 @@ def get_stable_component_sample(
         """Deterministic pick in [0, n) keyed by salt."""
         return int(_hl.sha256(salt.encode()).hexdigest(), 16) % n
 
-    # All CHESS:: data symbols
+    # All CHESS:: data symbols (debug ELF: gives us DWARF, sizes, field info)
     symbols = [
         s for s in analyze_cached(elf_path)
         if s.demangled.startswith(filter_prefix)
@@ -711,6 +752,31 @@ def get_stable_component_sample(
     if not symbols:
         return [], {}
 
+    # Build address-remap table from stable ELF if provided.  Keyed by mangled
+    # name (most reliable cross-ELF match).  Symbols present in the debug ELF
+    # but missing in the stable ELF stay on their debug-ELF address — those
+    # are reported as warnings so they can be excluded or investigated.
+    stable_addr: dict[str, int] = {}
+    if stable_elf_path is not None and Path(stable_elf_path).exists():
+        try:
+            stable_symbols = analyze_cached(Path(stable_elf_path))
+            stable_addr = {s.name: s.address for s in stable_symbols}
+            matched   = sum(1 for s in symbols if s.name in stable_addr)
+            unmatched = len(symbols) - matched
+            print(f"  Address remap: stable ELF '{Path(stable_elf_path).name}' "
+                  f"used for runtime addresses ({matched}/{len(symbols)} symbols matched"
+                  f"{f', {unmatched} unmatched → debug-ELF address kept' if unmatched else ''})",
+                  flush=True)
+        except Exception as _e:
+            print(f"  WARNING: stable ELF analysis failed ({_e}); "
+                  "falling back to debug-ELF addresses (may not match runtime BSS)",
+                  flush=True)
+    else:
+        print("  WARNING: no stable_elf_path provided; using debug-ELF addresses. "
+              "If debug and release binaries have different BSS layouts, every "
+              "injection will land in unrelated memory and the campaign will "
+              "report misleading 100% MASKED.", flush=True)
+
     # Group by component (first identifier after filter_prefix)
     comp_syms: dict[str, list] = {}
     for sym in symbols:
@@ -719,8 +785,12 @@ def get_stable_component_sample(
         if comp:
             comp_syms.setdefault(comp, []).append(sym)
 
-    # Resolve DWARF fields for all symbols at once (one DWARF parse)
-    all_fields = expand_symbol_fields(elf_path, symbols)  # sym.name -> [FieldInfo]
+    # Resolve DWARF fields for all symbols at once (one DWARF parse).
+    # Skipped entirely in byte-uniform mode (vtable_skip == 0): we want to hit
+    # every byte of every symbol uniformly, including those DWARF doesn't
+    # label (vtable pointers, base-class headers, padding).  Field labels
+    # would otherwise structurally exclude those bytes.
+    all_fields: dict = {} if vtable_skip == 0 else expand_symbol_fields(elf_path, symbols)
 
     # Build per-component list of injectable "units":
     # (sym, field_name_or_None, field_byte_offset, field_size_bytes)
@@ -739,7 +809,9 @@ def get_stable_component_sample(
                         continue
                     units.append((sym, fi.field_name, fi.offset, fi.size))
             else:
-                # No DWARF: whole injectable range is one anonymous unit
+                # No DWARF (or vtable_skip=0 byte-uniform mode): whole injectable
+                # range is one anonymous unit so every byte of the symbol is
+                # eligible — including vtables and header pointers.
                 injectable = sym.size - inject_start
                 if injectable > 0:
                     units.append((sym, None, inject_start, injectable))
@@ -800,7 +872,15 @@ def get_stable_component_sample(
                                  field_size * 8)
             byte_in_field = bit_in_field // 8
             bit = bit_in_field % 8
-            addr = sym.address + field_offset + byte_in_field
+
+            # ── Address remap: use stable-ELF (runtime) base when available ──
+            # The debug ELF gives us DWARF field offsets; the stable ELF gives
+            # us the address the running binary actually has the symbol at.
+            # If a symbol is missing from the stable ELF (e.g. added in debug
+            # build), we keep the debug-ELF address but it likely won't match
+            # runtime — caller should treat those targets with suspicion.
+            sym_base = stable_addr.get(sym.name, sym.address)
+            addr = sym_base + field_offset + byte_in_field
 
             targets.append({
                 "addr":        addr,
