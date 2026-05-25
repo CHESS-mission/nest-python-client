@@ -25,27 +25,32 @@ def run_ci(args) -> None:
     BSS addresses shift.  Exits 1 if any component masked rate increases by more
     than --threshold vs the baseline run.
     """
-    total_quota = getattr(args, "quota",      60)
-    seed        = getattr(args, "seed",       42)
-    threshold   = getattr(args, "threshold",  0.10)
-    baseline    = getattr(args, "baseline",   None)
-    ci_filter   = getattr(args, "ci_filter",  "CHESS::")
-    ci_exclude  = getattr(args, "ci_exclude", None)
+    total_quota   = getattr(args, "quota",         60)
+    per_component = getattr(args, "per_component", None)
+    seed          = getattr(args, "seed",          42)
+    threshold     = getattr(args, "threshold",     0.10)
+    baseline      = getattr(args, "baseline",      None)
+    ci_filter     = getattr(args, "ci_filter",     "CHESS::")
+    ci_exclude    = getattr(args, "ci_exclude",    None)
 
     # --sweep routes through the same pipeline as --ci, but with the symbol
     # filter cleared so every .bss/.data symbol is sampled proportionally to
-    # its size a radiation-like uniform-per-byte distribution rather than
-    # the namespace-scoped sample that --ci uses by default.  All other
-    # machinery (Layer-5, MASKED_CRITICAL promotion, stable-ELF address
-    # remapping, byte-restore between injections, 5-Layer Report) is
-    # identical, so a finding from --sweep can be reproduced byte-for-byte
-    # with --ci-debug on the same address.
+    # its size -- a radiation-like uniform-per-byte distribution rather than
+    # the namespace-scoped sample that --ci uses.  --per-component is forbidden
+    # in sweep mode (the whole point of sweep is byte-weighted sampling).
     sweep_mode = getattr(args, "sweep", False)
+    if sweep_mode and per_component:
+        sys.exit("ERROR: --per-component cannot be combined with --sweep "
+                 "(sweep is radiation-like proportional sampling by design)")
+
     if sweep_mode:
         ci_filter  = ""
         ci_exclude = None
         print_banner(f"SEU Radiation-Like Sweep  "
                      f"(uniform across .bss/.data  quota={total_quota}  seed={seed})")
+    elif per_component:
+        print_banner(f"SEU CI Regression Check  "
+                     f"(per-component={per_component}  seed={seed})")
     else:
         print_banner(f"SEU CI Regression Check  (quota={total_quota} total  seed={seed})")
 
@@ -81,6 +86,7 @@ def run_ci(args) -> None:
         exclude_re=ci_exclude,
         stable_elf_path=_stable_elf_path,
         vtable_skip=_vtable_skip,
+        per_component_quota=per_component,
     )
 
     if not targets:
@@ -90,9 +96,11 @@ def run_ci(args) -> None:
 
     n_comps = len(comp_quotas)
     _flt_disp = f"{ci_filter}*" if ci_filter else "<all .bss/.data symbols (sweep mode)>"
+    _dist_desc = (f"uniform per component"
+                  if per_component else "proportional by injectable bytes")
     print(f"  Filter     : {_flt_disp}")
     print(f"  Components : {n_comps}")
-    print(f"  Targets    : {len(targets)}  (proportional by injectable bytes)")
+    print(f"  Targets    : {len(targets)}  ({_dist_desc})")
     print()
     for comp in sorted(comp_quotas):
         print(f"    {comp_quotas[comp]:3d}x  {ci_filter}{comp}")
