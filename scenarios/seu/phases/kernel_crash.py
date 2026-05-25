@@ -15,6 +15,24 @@ from ..config import (
 from ..helpers import _insn_delta, print_banner
 
 
+def _topology_has_m4a(url: str) -> bool:
+    """Probe NEST for M4A presence in the running topology.
+
+    Returns True if the component is registered (regular SEU profile),
+    False otherwise (seu-debug profile, or NEST unreachable).  We fall back
+    to the no-M4A path on any error so the test still terminates promptly.
+    """
+    try:
+        with NestClient(url=url) as _nc:
+            _msg = _nc.wait_for_status("running", timeout=5.0)
+            _topo = _msg.get("topology")
+            if _topo is None:
+                return False
+            return "M4A" in json.dumps(_topo)
+    except Exception:
+        return False
+
+
 def run_kernel_crash_phase(_args) -> None:
     """
     Two-step kernel corruption:
@@ -24,10 +42,16 @@ def run_kernel_crash_phase(_args) -> None:
          within ~30 s and M4A fires SOFT_REBOOT_A7A (1st reboot).
       After reboot the kernel hits our UNDEF immediately -> M4A fires a second
       SOFT_REBOOT_A7A -> HARD_CRASH confirmed.
+
+    No-M4A topology (seu-debug): we cannot rely on the M4A reboot signal, so
+    instead we wait for the console to fall silent after the PC redirect; a
+    silent console means the kernel is dead and CHESS can no longer emit any
+    FPrime EVENT: lines -> HARD_CRASH.
     """
     M4A_FIRST_WINDOW  = 90.0
     M4A_SECOND_WINDOW = 90.0
     POST_REBOOT_WAIT  = 40.0
+    SILENCE_S         = 5.0     # console quiet for this long = kernel dead (no-M4A path)
 
     KERNEL_ENTRY_PHYS = 0x40008000
     ARM_UNDEF         = 0xE7F000F0
@@ -66,6 +90,51 @@ def run_kernel_crash_phase(_args) -> None:
           f"UNDEF -> M4A fires again -> HARD_CRASH")
     print()
 
+    # Probe the topology up-front so we know whether to expect M4A signals.
+    has_m4a = _topology_has_m4a(NEST_URL)
+    print(f"Topology probe: M4A {'present' if has_m4a else 'ABSENT'} "
+          f"(verdict path: {'M4A reboot signal' if has_m4a else 'console silence'})")
+
+    # No-M4A path (seu-debug profile) 
+    # Without M4A there is no autonomous OS reboot.  The kernel stays dead
+    # (CPU may keep spinning on the BSS NOP-slide, so _insn_delta is misleading),
+    # and the console stops receiving new FPrime EVENT: lines.  A silent console
+    # is the unambiguous signal that the kernel cannot recover.
+    if not has_m4a:
+        print(f"Kernel dead.  Watching console for {SILENCE_S:.0f}s of silence "
+              f"(no-M4A topology)…")
+        console_silent = False
+        if CONSOLE_LOG and CONSOLE_LOG.exists():
+            try:
+                size0 = CONSOLE_LOG.stat().st_size
+                time.sleep(SILENCE_S)
+                size1 = CONSOLE_LOG.stat().st_size
+                console_silent = (size1 == size0)
+                print(f"  Console size: {size0} -> {size1} "
+                      f"({'silent' if console_silent else 'active'})")
+            except OSError as _e:
+                print(f"  WARNING: cannot stat console log ({_e})")
+
+        final       = "HARD_CRASH" if console_silent else "CRASH_RECOVERED"
+        explanation = (
+            f"Console silent for {SILENCE_S:.0f}s after PC redirect; "
+            f"no M4A in topology → kernel cannot recover."
+            if console_silent else
+            f"Console still active after PC redirect (unexpected — kernel may have "
+            f"survived the corruption)."
+        )
+        colour = "\033[91m" if final == "HARD_CRASH" else "\033[93m"
+        print(f"\nFinal verdict: {colour}{final}\033[0m\n  {explanation}")
+        with RESULTS.open("a") as rf:
+            rf.write(json.dumps({"target": target_name, "outcome": final,
+                                 "evidence": explanation}) + "\n")
+        print(f"Result appended to {RESULTS}")
+        # Reset VM to clear physical RAM corruption.
+        print(f"\nResetting VM to clear kernel corruption (system_reset)…")
+        gdb.monitor_command("system_reset")
+        return
+
+    # M4A path (regular SEU profile)
     print(f"Kernel dead.  Waiting up to {M4A_FIRST_WINDOW:.0f}s for "
           f"M4A SOFT_REBOOT_A7A (Phoenix heartbeat loss)…")
     reboot1_seen = False
