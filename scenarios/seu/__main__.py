@@ -46,6 +46,7 @@ from seu.phases.sweep import run_automated_sweep
 from seu.phases.ci import run_ci
 from seu.phases.interactive import run_interactive
 from seu.phases.state_machine import run_state_machine
+from seu.phases.ci_debug import run_ci_debug
 
 
 def main() -> None:
@@ -68,6 +69,8 @@ def main() -> None:
                         help="Redundant topology: watch CPU_B for M4/Mux switchover after CRASH")
     parser.add_argument("--state-machine", action="store_true",
                         help="Pairwise invariant: inject into EventAction m_state (32 bit flips)")
+    parser.add_argument("--ci-debug",     action="store_true",
+                        help="CI oracle pipeline on user-specified targets (--targets / --targets-file)")
 
     parser.add_argument("--delay",       type=int,   default=1_000_000,
                         help="Instructions before each injection (default 1M)")
@@ -93,12 +96,32 @@ def main() -> None:
                         help="--ci: DB run_id (or prefix) to compare against")
     parser.add_argument("--ci-filter", metavar="PREFIX", default="CHESS::",
                         help="--ci: symbol prefix to include (default CHESS::)")
-    parser.add_argument("--ci-exclude", metavar="REGEX", default=None,
-                        help="--ci: exclude component names matching this regex")
+    parser.add_argument("--ci-exclude", metavar="REGEX", default="ConfigObjects|cmdSeq",
+                        help="--ci: exclude component names matching this regex "
+                             "(default: ConfigObjects=init-only dead data, cmdSeq=idle with no sequence running)")
+    parser.add_argument("--vtable-skip", type=int, default=64, metavar="N",
+                        help="--ci / --sweep: skip the first N bytes of each component "
+                             "symbol when sampling.  Default 64 excludes C++ vtable pointers "
+                             "and port-connection fields which would otherwise dominate the "
+                             "campaign with guaranteed CRASH-class outcomes.  Use "
+                             "--vtable-skip 0 to include those targets — recommended for "
+                             "radiation-realistic --sweep runs where you want CRASH outcomes "
+                             "to appear in the distribution.")
+    # --ci-debug target specs
+    parser.add_argument("--targets", nargs="+", metavar="SPEC",
+                        help="--ci-debug: space-separated target specs. "
+                             "Formats: 0xADDR:BIT[,BIT]  SYMBOL:BIT  SYMBOL::FIELD:BIT  "
+                             "(BIT may be comma-separated, e.g. 0x000c0930:0,3,7)")
+    parser.add_argument("--targets-file", metavar="FILE",
+                        help="--ci-debug: file with one target spec per line "
+                             "(# comments allowed; in Docker the path must be inside the container)")
+    parser.add_argument("--golden-duration", type=float, default=10.0,
+                        help="--ci-debug: seconds to sample CHESS's clean event stream "
+                             "before injections start (default 10)")
 
     args = parser.parse_args()
 
-    if not any([args.manual, args.sweep, args.ci, args.interactive,
+    if not any([args.manual, args.sweep, args.ci, args.ci_debug, args.interactive,
                 args.hard_crash, args.kernel_crash, args.detected,
                 args.redundant, args.state_machine]):
         args.manual = True
@@ -135,7 +158,9 @@ def main() -> None:
         except Exception as _e:
             print(f"  WARNING: could not reset M4B ({_e})")
 
-    if args.interactive:
+    if args.ci_debug:
+        run_ci_debug(args)
+    elif args.interactive:
         run_interactive(args)
     elif args.kernel_crash:
         run_kernel_crash_phase(args)
@@ -146,7 +171,13 @@ def main() -> None:
         if _console_oracle:
             _console_oracle.stop()
     elif args.sweep:
-        run_automated_sweep(args)
+        # --sweep now routes through the same campaign engine as --ci,
+        # with the symbol filter cleared.  This gives a radiation-like
+        # uniform-per-byte sample across all .bss/.data symbols while
+        # benefiting from Layer-5 / MASKED_CRITICAL / stable-ELF remap /
+        # byte-restore.  The legacy run_automated_sweep is retained but
+        # no longer the default it's missing the new pipeline features.
+        run_ci(args)
     elif args.ci:
         run_ci(args)
     elif args.state_machine:
