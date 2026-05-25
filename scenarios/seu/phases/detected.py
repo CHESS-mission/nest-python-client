@@ -105,52 +105,104 @@ def run_detected_phase(args, pre_oracle=None) -> None:
     WRITE_MSG_ADDR = (write_msg_sym.address & ~1) if write_msg_sym else 0x00016ce8
     print(f"  PosixConsole::writeMessage @ 0x{WRITE_MSG_ADDR:08x}")
 
-    # Scan health BSS for "CdhCore_cmdDisp" to locate the PingTracker.
-    TARGET_STR   = b"CdhCore_cmdDisp"
-    health_start = health_sym.address
-    health_size  = health_sym.size
-    print(f"  Scanning health BSS for 'CdhCore_cmdDisp'…", flush=True)
+    # Find the PingTracker for "CdhCore_cmdDisp" in runtime BSS.
+    #
+    # PingTracker layout (stable across FPrime versions):
+    #   +0:  warnCycles  (U64) = 3
+    #   +8:  fatalCycles (U64) = 5
+    #   +16: Fw::String vtable ptr  (4 bytes)
+    #   +20: m_buf — the component name as a null-terminated ASCII string
+    #   +280: cycleCount (U32)
+    #
+    # The running (optimised) binary's BSS layout may differ from the debug
+    # ELF used for symbol resolution (dual-binary build).  We scan the full
+    # BSS for the combined signature (warnCycles=3 + fatalCycles=5 + name)
+    # rather than trusting the ELF symbol address.
+    WARN_SIGN    = struct.pack("<Q", 3)   # warnCycles=3 U64
+    FATAL_SIGN   = struct.pack("<Q", 5)  # fatalCycles=5 U64
+    TARGET_NAME  = b"CdhCore_cmdDisp"
+    PING_SIGN    = WARN_SIGN + FATAL_SIGN  # 16-byte prefix at PingTracker+0
+    STEP         = 0x800  # 2 KB per GDB read
 
-    step      = 0x200
-    read_specs = [(health_start + off, min(step, health_size - off))
-                  for off in range(0, health_size, step)]
-    rb_all    = _gdb.read_bulk(read_specs)
-    data      = b"".join(rb_all)
-    idx       = data.find(TARGET_STR)
-    if idx < 0:
-        print("ERROR: could not locate CdhCore_cmdDisp PingTracker in health BSS")
+    def _find_pingtracker_in_region(base: int, size: int):
+        """Scan a BSS region for a valid CdhCore_cmdDisp PingTracker.
+
+        Returns (pingtracker_vaddr, cyclecount_vaddr) or None.
+        A valid hit requires: PING_SIGN at offset 0 AND TARGET_NAME at offset +20.
+        """
+        buf = b""
+        off = 0
+        while off < size:
+            chunk_size = min(STEP, size - off)
+            chunk = b"".join(_gdb.read_bulk([(base + off, chunk_size)]))
+            if chunk:
+                buf += chunk
+            else:
+                buf += b"\x00" * chunk_size   # fill unmapped gaps with zeros
+            off += chunk_size
+
+        # Search for PING_SIGN; verify TARGET_NAME at +20
+        search_start = 0
+        while True:
+            i = buf.find(PING_SIGN, search_start)
+            if i < 0:
+                return None
+            # Check TARGET_NAME 20 bytes after PING_SIGN start
+            name_off = i + 20
+            if name_off + len(TARGET_NAME) <= len(buf):
+                if buf[name_off:name_off + len(TARGET_NAME)] == TARGET_NAME:
+                    pt_vaddr = base + i
+                    return pt_vaddr, pt_vaddr + 280
+            search_start = i + 1
+
+    print(f"  Searching BSS for PingTracker(warnCycles=3, name='CdhCore_cmdDisp')…",
+          flush=True)
+
+    # Try ELF health BSS first (fast path when binaries match).
+    result = _find_pingtracker_in_region(health_sym.address, health_sym.size)
+
+    if result is None:
+        # Try pingEntries (newer FPrime topology layout).
+        ping_sym = next((s for s in symbols
+                         if "pingEntries" in s.demangled
+                         and "CdhCore" in s.demangled
+                         and s.section == ".bss"), None)
+        if ping_sym:
+            print(f"  Not in health BSS — trying pingEntries "
+                  f"@ 0x{ping_sym.address:08x}…", flush=True)
+            result = _find_pingtracker_in_region(ping_sym.address, ping_sym.size)
+
+    if result is None:
+        # Wide BSS scan: covers dual-binary BSS layout divergence.
+        bss_syms  = sorted((s for s in symbols if s.section == ".bss"),
+                            key=lambda s: s.address)
+        bss_base  = bss_syms[0].address if bss_syms else 0xbf000
+        bss_limit = min(bss_base + 0x200000,
+                        max((s.address + s.size for s in bss_syms),
+                            default=bss_base + 0x100000))
+        print(f"  Wide BSS scan 0x{bss_base:08x}…0x{bss_limit:08x} "
+              f"({(bss_limit-bss_base)//1024} KB)…", flush=True)
+        result = _find_pingtracker_in_region(bss_base, bss_limit - bss_base)
+
+    if result is None:
+        print("ERROR: could not locate CdhCore_cmdDisp PingTracker in BSS")
         return
 
-    string_vaddr    = health_start + idx
-    found_base      = string_vaddr - 20    # m_buf is at PingTracker+20
-    cycleCount_addr = found_base + 280
-    key_addr        = found_base + 284
-    enabled_addr    = found_base + 288
-    bss_offset      = found_base - health_start
+    found_base, cycleCount_addr = result
+    string_vaddr = found_base + 20
+    key_addr     = found_base + 284
+    enabled_addr = found_base + 288
+    bss_offset   = found_base - health_sym.address   # offset from ELF health sym
+
     print(f"  Found 'CdhCore_cmdDisp' @ 0x{string_vaddr:08x}", flush=True)
-    print(f"  PingTracker base @ 0x{found_base:08x}  (BSS+{bss_offset})")
+    print(f"  PingTracker base @ 0x{found_base:08x}  "
+          f"(offset {bss_offset:+d} from ELF health symbol)")
     print(f"  cycleCount @ 0x{cycleCount_addr:08x}  enabled @ 0x{enabled_addr:08x}")
 
-    # Confirm warnCycles=3 (CHESS fully initialised).
+    # The scan validated warnCycles=3 + fatalCycles=5 as part of its signature,
+    # so no further init check is needed.
     def _u32(b: bytes):
         return struct.unpack_from("<I", b)[0] if len(b) >= 4 else None
-
-    for _init_attempt in range(6):
-        rb_wc = _gdb.read_bulk([(found_base, 8)])
-        wc_val = struct.unpack_from("<Q", rb_wc[0])[0] if rb_wc and len(rb_wc[0]) >= 8 else 0
-        if wc_val == 3:
-            break
-        print(f"  PingTracker warnCycles={wc_val} (expected 3) — "
-              f"waiting 5s for CHESS init…", flush=True)
-        time.sleep(5.0)
-        rb_all2 = _gdb.read_bulk(read_specs)
-        data2   = b"".join(rb_all2)
-        idx2    = data2.find(TARGET_STR)
-        if idx2 >= 0:
-            found_base      = health_start + idx2 - 20
-            cycleCount_addr = found_base + 280
-    else:
-        print("WARNING: PingTracker warnCycles never became 3 — proceeding anyway", flush=True)
 
     # Inject cycleCount and wait for HealthImpl to fire.
     print(f"\nWaiting {SETTLE_S:.0f}s for comQueue overflow to settle…", flush=True)
