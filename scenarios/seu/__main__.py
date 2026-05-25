@@ -89,7 +89,13 @@ def main() -> None:
 
     # CI-specific options
     parser.add_argument("--quota",     type=int,   default=60,
-                        help="--ci: total injections distributed proportionally across components (default 60)")
+                        help="--ci / --sweep: total injections distributed proportionally "
+                             "by injectable bytes across components (default 60).  Ignored "
+                             "when --per-component is set.")
+    parser.add_argument("--per-component", type=int, metavar="N",
+                        help="--ci: exactly N injections per CHESS:: component, equal "
+                             "statistical weight regardless of byte size (overrides --quota). "
+                             "Forbidden with --sweep -- sweep is radiation-like by design.")
     parser.add_argument("--threshold", type=float, default=0.10,
                         help="--ci: masked-rate increase that triggers failure (default 0.10)")
     parser.add_argument("--baseline",  metavar="RUN_ID",
