@@ -3,11 +3,11 @@
 fault_injector.py Python client for the fault_inject TCG plugin.
 
 This module provides:
-  • FaultInjectorClient   low-level JSON socket client
-  • InjectionScheduler    higher-level scheduler that waits for the right
+  - FaultInjectorClient   low-level JSON socket client
+  - InjectionScheduler    higher-level scheduler that waits for the right
                           instruction-count window and fires injections
-  • InjectionResult       dataclass for structured results
-  • SEUCampaign           runs a sequence of injections and records outcomes
+  - InjectionResult       dataclass for structured results
+  - SEUCampaign           runs a sequence of injections and records outcomes
 
 Typical use (manual Phase 1)
 -----------------------------
@@ -51,7 +51,7 @@ from typing import Callable, Iterable, Optional, Tuple, Union
 CHESS_READY_KEYWORDS: list[str] = [
     "CHESS_Pathfinder0FS", "OpCodeRegistered", "Starting HealthImpl",
     "Registered with", "all components ready", "rate group", "SENSOR_POLL_CYCLE",
-    "EVENT:",  # steady-state F' telemetry — proof CHESS is alive after boot
+    "EVENT:",  # steady-state F' telemetry - proof CHESS is alive after boot
 ]
 
 # GDB Remote Serial Protocol memory writer
@@ -137,39 +137,76 @@ class GdbMemWriter:
                 break
         return ""
 
-    def monitor_command(self, cmd: str) -> str:
+    _SNAPSHOT_TIMEOUT = 60.0  # savevm/loadvm on a 1 GB VM can take ~10-30s
+
+    def monitor_command(self, cmd: str, timeout: float = 3.0) -> str:
         """
         Send a QEMU human-monitor command via GDB RSP qRcmd passthrough.
 
         Returns the response string (stripped of leading 'O' output packets).
         Useful for physical-memory writes: ``writel PHYS_ADDR VALUE``.
+        Use a larger ``timeout`` for slow commands like savevm/loadvm.
         """
         try:
             with self._session() as (s, _):
                 hex_cmd = cmd.encode("ascii").hex()
                 s.sendall(self._pkt(f"qRcmd,{hex_cmd}"))
                 # Drain: QEMU sends 0..N  "O<hex_text>" output packets then "OK"
-                result = ""
-                deadline = time.monotonic() + 3.0
+                output = ""
+                got_ok = False
+                deadline = time.monotonic() + timeout
                 while time.monotonic() < deadline:
                     resp = self._recv_pkt(s, timeout=1.0)
                     if not resp:
                         break
                     if resp == "OK":
-                        result = "OK"
+                        got_ok = True
                         break
                     if resp.startswith("O"):
                         try:
-                            result += bytes.fromhex(resp[1:]).decode("ascii", errors="replace")
+                            output += bytes.fromhex(resp[1:]).decode("ascii", errors="replace")
                         except Exception:
                             pass
                     elif resp.startswith("E"):
-                        result = resp
+                        output = resp
                         break
                 s.sendall(self._pkt("c"))
-                return result
+                # Return "OK" when the command completed with no text output.
+                # Return the text (which may contain "Error: ...") when QEMU
+                # printed something - callers can check for error markers.
+                return "OK" if got_ok and not output else output
         except Exception:
             return ""
+
+    def savevm(self, name: str = "chess_ready") -> tuple[bool, str]:
+        """Save a QEMU VM snapshot. Blocks until QEMU confirms (~10-30s).
+
+        Returns ``(ok, message)``. ``ok=True`` means QEMU accepted the save
+        (response was "OK" or non-Error text such as "Successfully saved...").
+        ``message`` contains QEMU's stderr text on failure — most commonly
+        ``"Error: State blocked by non-migratable device '...vhost-user-gpio'"``
+        when the topology includes a device that does not support live
+        migration.  Empty string on silent success.
+        """
+        resp = self.monitor_command(f"savevm {name}", timeout=self._SNAPSHOT_TIMEOUT)
+        # monitor_command returns "OK" only when QEMU printed nothing.  A
+        # successful savevm may print "Successfully saved..." then OK; a failed
+        # one prints "Error: ..." then OK.  Use the presence of "Error:" as the
+        # real failure signal rather than the absence of output.
+        if resp == "OK":
+            return True, ""
+        if "Error:" in resp:
+            return False, resp.strip()
+        return True, resp.strip()
+
+    def loadvm(self, name: str = "chess_ready") -> bool:
+        """Restore a QEMU VM snapshot. Blocks until QEMU confirms (~5-15s)."""
+        resp = self.monitor_command(f"loadvm {name}", timeout=self._SNAPSHOT_TIMEOUT)
+        return resp == "OK"
+
+    def system_reset(self) -> None:
+        """Send a system_reset to QEMU - triggers a clean VM reboot."""
+        self.monitor_command("system_reset", timeout=5.0)
 
     def writes_and_reads(self,
                          writes: list[tuple[int, int]],
@@ -266,7 +303,7 @@ class GdbMemWriter:
         """
         try:
             with self._session() as (s, _):
-                # Read all registers ($g): ARM has ≥ 26 regs in GDB register file.
+                # Read all registers ($g): ARM has >= 26 regs in GDB register file.
                 # Core GPRs r0-r15 occupy the first 64 bytes (128 hex chars).
                 s.sendall(self._pkt("g"))
                 all_regs = self._recv_pkt(s, timeout=2.0)
@@ -276,7 +313,7 @@ class GdbMemWriter:
 
                 pc_before = struct.unpack("<I", bytes.fromhex(all_regs[60*2:64*2]))[0]
 
-                # Patch r15 (bytes 60–63 in the LE register dump)
+                # Patch r15 (bytes 60-63 in the LE register dump)
                 le_hex   = struct.pack("<I", bad_pc).hex()
                 modified = all_regs[:60*2] + le_hex + all_regs[64*2:]
 
@@ -325,20 +362,52 @@ class GdbMemWriter:
         except Exception:
             pass
 
-    def write_byte(self, addr: int, value: int) -> bool:
+    def write_byte(self, addr: int, value: int, max_retries: int = 30) -> bool:
         """
-        Halt QEMU, overwrite the byte at *addr* with *value*, then resume.
-        Returns True if QEMU acknowledged the write with OK.
+        Halt QEMU, overwrite the byte at *addr* with *value*, read it back to
+        verify, then resume.  Retries up to *max_retries* times if the read-back
+        doesn't match — handles the common case where GDB halts the CPU in
+        kernel context, the protocol-level write returns "OK", but the byte
+        didn't actually land because the user-space page wasn't currently
+        mapped.
+
+        Returns True only if a read-back confirms the value landed; False if
+        every retry attempt failed or hit an exception.
         """
-        try:
-            with self._session() as (s, _):
-                s.sendall(self._pkt(f"M{addr:x},1:{value:02x}"))
-                resp = self._recv_pkt(s, timeout=2.0)
-                write_ok = resp == "OK"
-                s.sendall(self._pkt("c"))
-                return write_ok
-        except Exception:
-            return False
+        for attempt in range(max_retries):
+            try:
+                with self._session() as (s, _):
+                    # Select CPU_A (thread 1) so the write targets CHESS, not
+                    # CPU_B/M4A.  Matches writes_and_reads()'s context handling.
+                    s.sendall(self._pkt("Hg1"))
+                    self._recv_pkt(s, timeout=1.0)
+                    # Write
+                    s.sendall(self._pkt(f"M{addr:x},1:{value:02x}"))
+                    self._recv_pkt(s, timeout=2.0)
+                    # Verify by reading back the same byte
+                    s.sendall(self._pkt(f"m{addr:x},1"))
+                    resp = self._recv_pkt(s, timeout=2.0)
+                    # Resume
+                    s.sendall(self._pkt("c"))
+                    s.settimeout(5.0)
+                    try:
+                        s.recv(64)
+                    except (socket.timeout, OSError):
+                        pass
+                # Check the read-back: must be exactly the byte we wrote.
+                if (resp and len(resp) >= 2
+                        and all(c in "0123456789abcdefABCDEF" for c in resp[:2])):
+                    actual = int(resp[:2], 16)
+                    if actual == (value & 0xff):
+                        if attempt > 0:
+                            print(f"  write_byte: landed on attempt {attempt+1}",
+                                  flush=True)
+                        return True
+            except Exception:
+                pass
+            if attempt < max_retries - 1:
+                time.sleep(0.1)
+        return False
 
 
 # Low-level client
@@ -370,6 +439,11 @@ class InjectionResult:
     last_events: list   = None       # last FPrime EVENT: lines seen (proof of life)
     recovery_path: str  = ""         # FS_RESTART | OS_REBOOT | "" (for CRASH only)
     recovery_time_s: float = None    # seconds from crash to CHESS ready
+    # Layer-5 GOLDEN suspect evidence - populated by the per-injection critical-params
+    # integrity check inside SEUCampaign.run_targets when a MASKED outcome has at least
+    # one diverged param.  Format: "critical param diverged: <name> expected=<e> got=<a>".
+    # Empty for non-MASKED outcomes and for MASKED results that passed the integrity check.
+    suspect_reason: str = ""
 
     def __post_init__(self):
         if self.last_events is None:
@@ -566,7 +640,7 @@ class PtyOracle:
     ----------------
     Patterns are component-agnostic.  Three independent signals are used:
 
-    1. OS/process crash strings (kernel panic, segfault, abort, …).
+    1. OS/process crash strings (kernel panic, segfault, abort, ...).
     2. FPrime-level crash: "Assert:" in the output (FW_ASSERT fires before exit).
     3. FPrime EVR severity: any EVR line that carries WARNING / ERROR / FATAL
        in its severity field covers Svc::Health ping warnings AND any future
@@ -602,7 +676,7 @@ class PtyOracle:
         re.IGNORECASE,
     )
 
-    # Known background noise — events that fire in normal simulation operation
+    # Known background noise - events that fire in normal simulation operation
     # regardless of injections.  Matching these should NOT trigger DETECTED.
     # comQueue QueueOverflow: telemetry downlink queue fills when no real ground
     # station is connected.  This is an infrastructure condition, not a fault
@@ -613,7 +687,7 @@ class PtyOracle:
     )
 
     # How long (seconds) without any EVENT: line before we declare the FS dead.
-    # In TCG Docker mode F' emits EVRs only at startup and on faults — not
+    # In TCG Docker mode F' emits EVRs only at startup and on faults - not
     # periodically in steady state.  Set the timeout larger than OBSERVATION_S
     # (120s) so the liveness check does not fire mid-observation; the real
     # liveness signal is the instruction-count oracle, not EVR frequency.
@@ -736,7 +810,7 @@ class PtyOracle:
             {
                 "outcome":  "CRASH" | "DETECTED" | "MASKED",
                 "evidence": <line / reason that triggered the verdict>,
-                "last_events": [last ≤5 FPrime EVENT lines seen],
+                "last_events": [last <=5 FPrime EVENT lines seen],
             }
 
         ``evidence`` identifies the specific fault signal.
@@ -843,7 +917,7 @@ def restart_chess_in_qemu(pty_log: Union[Optional[Path], Tuple[str, int]],
               flush=True)
         return False
 
-    print(f"  Waiting for CHESS ready (watching {pty_log})…", flush=True)
+    print(f"  Waiting for CHESS ready (watching {pty_log})...", flush=True)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
@@ -885,6 +959,46 @@ class CampaignConfig:
     # GDB host/port for fallback write when plugin direct_write=NO (stripped QEMU).
     gdb_host: str | None = None
     gdb_port: int        = 1234
+    # Fast inter-injection recovery via QEMU VM snapshot.
+    # Set snapshot_name to the name passed to savevm() before the campaign.
+    # If set (and gdb_host is set), loadvm is used after every injection instead
+    # of waiting for Phoenix to restart CHESS.
+    snapshot_name: str | None = None
+    # NEST WebSocket URL for M4B mux reset after loadvm (NEST components are not
+    # restored by QEMU snapshots and must be reset explicitly).
+    nest_url: str | None = None
+    # Post-classification hook for pairwise invariant checks.
+    #
+    # Called after the PTY oracle classifies each injection.  Signature:
+    #   hook(result: InjectionResult) -> str | None
+    # Return value semantics:
+    #   None          - keep the oracle's outcome as-is
+    #   "<OUTCOME>"   - override result.outcome with this string
+    #   "STOP"        - override outcome AND stop the campaign immediately.
+    #                   The campaign raises _StopCampaign; callers should catch
+    #                   it or let it propagate to abort CI with exit(1).
+    #
+    # Priority contract: the hook MUST NOT override "DETECTED" (FPrime already
+    # observed the fault via its own health system).  It SHOULD override
+    # "CRASH" and "MASKED" when a pairwise invariant violation is detected,
+    # because INCONSISTENT / CORRUPTED is the root cause of such failures.
+    classify_hook: Callable[["InjectionResult"], Optional[str]] = None  # type: ignore[assignment]
+    # Override PtyOracle.LIVENESS_TIMEOUT_S (default 300s).  Set to a short
+    # value (e.g. 5.0) when running against a no_phoenix topology so that
+    # 5 s of console silence is sufficient to classify a crash.
+    liveness_timeout_s: float | None = None
+    # Layer-5 GOLDEN integrity check: list of safety-critical BSS words to
+    # verify after every MASKED injection.  Build via
+    # nest_client.seu.critical_params.build_health_critical_params() at boot,
+    # then pass here.  When set, run_targets() reads all params via GDB after
+    # each classify() (before the reset wipes state); any divergence is stashed
+    # in result.suspect_reason and promotes the MASKED to "suspect" in the
+    # summary report.  Unified across --ci and --ci-debug.
+    critical_params: list = None  # list[CriticalParam] | None  (avoiding circular import)
+
+
+class _StopCampaign(Exception):
+    """Raised by classify_hook to cut a campaign early (e.g. INCONSISTENT found)."""
 
 
 class SEUCampaign:
@@ -925,6 +1039,40 @@ class SEUCampaign:
             elf_path=self.cfg.elf_path, topology=topology, notes=notes,
         )
         return self._run_id
+
+    def setup_snapshot(self, name: str = "chess_ready") -> bool:
+        """
+        Save a QEMU VM snapshot for fast inter-injection recovery.
+
+        Call this once after CHESS is ready (before run_targets).  Sets
+        cfg.snapshot_name so run_targets will use loadvm after each injection
+        instead of waiting for Phoenix to restart CHESS.
+
+        Returns True on success, False if GDB is not configured or savevm fails.
+        """
+        if not self.cfg.gdb_host:
+            print("  setup_snapshot: no GDB host configured - skipping", flush=True)
+            return False
+        gdb = GdbMemWriter(host=self.cfg.gdb_host, port=self.cfg.gdb_port)
+        print(f"  Saving VM snapshot '{name}'...", flush=True)
+        t0 = time.monotonic()
+        ok, err = gdb.savevm(name)
+        elapsed = time.monotonic() - t0
+        if ok:
+            self.cfg.snapshot_name = name
+            print(f"  Snapshot '{name}' saved ({elapsed:.1f}s)", flush=True)
+            return True
+        # A non-migratable device in the QEMU topology (typically vhost-user-gpio)
+        # is an expected limitation, not a bug downgrade to an informational
+        # note.  Anything else is a real failure worth warning about.
+        if "non-migratable device" in err:
+            print(f"  Note: savevm unsupported by current QEMU topology "
+                  f"({elapsed:.1f}s) — falling back to system_reset for "
+                  f"crash recovery", flush=True)
+        else:
+            print(f"  WARNING: savevm '{name}' failed ({elapsed:.1f}s): {err} "
+                  f"— falling back to system_reset for crash recovery", flush=True)
+        return False
 
     # Core injection loop
 
@@ -982,7 +1130,7 @@ class SEUCampaign:
         # Classify FPrime's response.
         # Always run the event oracle to catch DETECTED (WARNING/ERROR/FATAL
         # EVENT: lines).  Supplement with a fast instruction-count crash check:
-        # if the vCPU stops advancing within 2 s of injection, that is a CRASH —
+        # if the vCPU stops advancing within 2 s of injection, that is a CRASH -
         # no need to wait out the full observation window.
         if self.cfg.use_insn_count_liveness:
             count_before = client.get_count()
@@ -1004,11 +1152,11 @@ class SEUCampaign:
             if (_c1 - _c0) < 500_000:
                 verdict = {
                     "outcome":  "CRASH",
-                    "evidence": f"insn delta={_c1-_c0:,} over 2s — vCPU halted",
+                    "evidence": f"insn delta={_c1-_c0:,} over 2s - vCPU halted",
                     "last_events": [],
                 }
             else:
-                # vCPU alive — run the event oracle for the full half-window.
+                # vCPU alive - run the event oracle for the full half-window.
                 # The 2 s crash check runs in parallel conceptually; do NOT
                 # subtract it from the oracle budget so health-monitoring events
                 # have enough time to fire (FPrime needs ~10 s).
@@ -1040,6 +1188,8 @@ class SEUCampaign:
         """
         oracle = PtyOracle(self.cfg.pty_log_path)
         oracle.start()
+        if self.cfg.liveness_timeout_s is not None:
+            oracle.LIVENESS_TIMEOUT_S = self.cfg.liveness_timeout_s
 
         specs = list(specs)
         results = []
@@ -1054,6 +1204,7 @@ class SEUCampaign:
 
         try:
             with FaultInjectorClient(self.cfg.socket_path) as client:
+              try:
                 for i, spec in enumerate(specs):
                     oracle.drain()
 
@@ -1067,84 +1218,200 @@ class SEUCampaign:
                           f"delay={spec.delay:,} insns")
 
                     result = self._run_one(client, oracle, spec)
+
+                    # Layer-5 GOLDEN integrity check
+                    # Run BEFORE pairwise hook / reset / DB write because the
+                    # upcoming reset (loadvm or system_reset) will wipe any
+                    # corrupted state back to baseline.  MASKED-only: the
+                    # other outcomes already have their own evidence path.
+                    #
+                    # When Layer-5 finds drift, we promote the outcome itself
+                    # from MASKED to MASKED_CRITICAL.  Operationally that's a
+                    # silent-corruption finding: the FS appears running but
+                    # safety-critical state has been corrupted — same severity
+                    # class as CRASH for downstream dashboards/alerting.
+                    if result.outcome == "MASKED" and self.cfg.critical_params:
+                        try:
+                            from nest_client.seu.critical_params import check_critical_params
+                            _gdb_l5 = GdbMemWriter(host=self.cfg.gdb_host,
+                                                   port=self.cfg.gdb_port)
+                            diverged = check_critical_params(self.cfg.critical_params, _gdb_l5)
+                            if diverged:
+                                name, exp, act = diverged[0]
+                                extra = f" (+{len(diverged)-1} more)" if len(diverged) > 1 else ""
+                                result.outcome = "MASKED_CRITICAL"
+                                result.suspect_reason = (
+                                    f"critical param diverged: {name} "
+                                    f"expected={exp} got={act}{extra}"
+                                )
+                                print(f"  Layer-5: {len(diverged)} critical param(s) "
+                                      f"diverged - first: {name} expected={exp} got={act} "
+                                      "→ outcome promoted to MASKED_CRITICAL",
+                                      flush=True)
+                        except Exception as _e:
+                            print(f"  WARNING: Layer-5 check failed ({_e})", flush=True)
+
+                    # Pairwise invariant hook - runs after PTY oracle, before DB write.
+                    # Priority: DETECTED and MASKED_CRITICAL are sacred findings:
+                    #   - DETECTED        - FPrime itself observed the fault
+                    #   - MASKED_CRITICAL - Layer-5 found safety-critical drift
+                    # Both are real, evidenced findings; pairwise is a separate
+                    # cross-subsystem invariant signal and shouldn't relabel them.
+                    # For other outcomes (CRASH, MASKED, NO_INJECT), the hook can
+                    # override with INCONSISTENT / CORRUPTED and optionally stop.
+                    _sacred = ("DETECTED", "MASKED_CRITICAL")
+                    if self.cfg.classify_hook and result.outcome not in _sacred:
+                        hook_out = self.cfg.classify_hook(result)
+                        if hook_out == "STOP":
+                            results.append(result)
+                            self._append_result(result)
+                            print(f"  -> {result.summary()}", flush=True)
+                            print(f"\n  *** CAMPAIGN STOPPED: pairwise invariant violated "
+                                  f"on injection [{i+1}/{len(specs)}] ***", flush=True)
+                            raise _StopCampaign(result.outcome)
+                        elif hook_out is not None:
+                            result.outcome = hook_out
+
                     results.append(result)
                     print(f"  -> {result.summary()}", flush=True)
 
                     # Show proof-of-life for MASKED (last EVENT: lines oracle saw)
                     if result.outcome == "MASKED" and result.last_events:
                         for ev in result.last_events[-2:]:
-                            print(f"  oracle: {ev[:100]}", flush=True)
+                            print(f"  oracle: {ev[:200]}", flush=True)
 
                     is_last = (i >= len(specs) - 1)
 
-                    if result.outcome == "MASKED" and result.success:
-                        # Restore the flipped byte so each injection is independent.
-                        if self.cfg.gdb_host and not is_last:
-                            try:
-                                _gdb_r = GdbMemWriter(host=self.cfg.gdb_host,
-                                                      port=self.cfg.gdb_port)
-                                _ok = _gdb_r.write_byte(spec.addr, result.original)
-                                print(f"  Restored 0x{result.flipped:02x}->"
-                                      f"0x{result.original:02x} at "
-                                      f"0x{spec.addr:08x}  "
-                                      f"({'ok' if _ok else 'FAILED — next injection not independent'})",
+                    if not is_last and reset_between:
+                        _t0 = time.monotonic()
+
+                        if self.cfg.snapshot_name and self.cfg.gdb_host:
+                            # Fast path: restore VM snapshot - works for all outcomes.
+                            _gdb_snap = GdbMemWriter(host=self.cfg.gdb_host,
+                                                     port=self.cfg.gdb_port)
+                            _ok = _gdb_snap.loadvm(self.cfg.snapshot_name)
+                            _rtime = round(time.monotonic() - _t0, 1)
+                            result.recovery_path   = "SNAPSHOT"
+                            result.recovery_time_s = _rtime
+                            if _ok:
+                                print(f"  Snapshot '{self.cfg.snapshot_name}' "
+                                      f"restored ({_rtime:.1f}s)", flush=True)
+                            else:
+                                print(f"  WARNING: loadvm "
+                                      f"'{self.cfg.snapshot_name}' failed",
                                       flush=True)
-                            except Exception as _e:
-                                print(f"  WARNING: GDB restore failed ({_e})",
-                                      flush=True)
-                        oracle.drain()
-                        self._append_result(result)
+                            # M4B is a NEST WASM component - not restored by loadvm.
+                            # Reset the mux to CPU_A so CHESS can reach sensors/UART.
+                            if self.cfg.nest_url:
+                                try:
+                                    from nest_client.client import NestClient
+                                    with NestClient(url=self.cfg.nest_url) as _nc:
+                                        _nc.send_command("M4B",
+                                                         "switch_back_to_a7a", "{}")
+                                except Exception as _e:
+                                    print(f"  WARNING: M4B reset failed ({_e})",
+                                          flush=True)
 
-                    elif reset_between and not is_last:
-                        # CRASH or DETECTED: wait for FPrime to restart, and
-                        # classify the recovery path while waiting (zero extra time).
-                        print("  Waiting for CHESS ready…", flush=True)
-                        _t_crash = time.monotonic()
-                        # For DETECTED the FS is still running — no restart occurred.
-                        _rpath = "" if result.outcome == "CRASH" else "NONE"
-                        _ready = ""
-                        _deadline = _t_crash + 120.0
+                        elif (result.outcome in ("MASKED", "MASKED_CRITICAL")
+                              and result.success):
+                            # Restore the flipped byte via GDB so the next
+                            # injection starts from a clean state.  Also applies
+                            # to MASKED_CRITICAL Layer-5 found the corruption,
+                            # but the next injection still needs the byte
+                            # reverted, otherwise the persistent corruption
+                            # cascades into every subsequent Layer-5 check and
+                            # produces false "everything diverged" alarms.
+                            if self.cfg.gdb_host:
+                                try:
+                                    _gdb_r = GdbMemWriter(host=self.cfg.gdb_host,
+                                                          port=self.cfg.gdb_port)
+                                    _ok = _gdb_r.write_byte(spec.addr, result.original)
+                                    print(f"  Restored 0x{result.flipped:02x}->"
+                                          f"0x{result.original:02x} at "
+                                          f"0x{spec.addr:08x}  "
+                                          f"({'ok' if _ok else 'FAILED - next injection not independent'})",
+                                          flush=True)
+                                except Exception as _e:
+                                    print(f"  WARNING: GDB restore failed ({_e})",
+                                          flush=True)
 
-                        _boot_oracle = PtyOracle(self.cfg.pty_log_path,
-                                                 seek_to_end=True)
-                        _boot_oracle.start()
-                        try:
-                            while time.monotonic() < _deadline:
-                                for line in _boot_oracle.recent_lines(500):
-                                    if not _rpath:
-                                        if _OS_REBOOT_RE.search(line):
-                                            _rpath = "OS_REBOOT"
-                                        elif _FS_RESTART_RE.search(line):
-                                            _rpath = "FS_RESTART"
-                                    if any(kw in line for kw in _FPRIME_BOOT_KW):
-                                        _ready = line.strip()
-                                        break
-                                if _ready:
-                                    break
-                                time.sleep(1.0)
-                        finally:
-                            _boot_oracle.stop()
-
-                        _rtime = time.monotonic() - _t_crash
-                        result.recovery_path   = _rpath or "UNKNOWN"
-                        result.recovery_time_s = round(_rtime, 1)
-
-                        if _ready:
-                            print(f"  CHESS ready ({result.recovery_path} "
-                                  f"{result.recovery_time_s:.0f}s): "
-                                  f"{_ready[:70]}", flush=True)
                         else:
-                            last = _boot_oracle.recent_lines(3)
-                            print(f"  WARNING: CHESS ready timeout "
-                                  f"({result.recovery_path}, "
-                                  f"{result.recovery_time_s:.0f}s). "
-                                  f"Last: {last}", flush=True)
+                            # Fallback: wait for FPrime/Phoenix to restart CHESS.
+                            # For CRASH outcomes with a GDB host, force a clean
+                            # VM reboot via system_reset - Phoenix's auto-restart
+                            # can get stuck in a crash loop that never clears.
+                            _t_crash = time.monotonic()
+                            _rpath = "" if result.outcome == "CRASH" else "NONE"
+
+                            if result.outcome == "CRASH" and self.cfg.gdb_host:
+                                print("  CRASH - sending system_reset...", flush=True)
+                                try:
+                                    _gdb_rst = GdbMemWriter(host=self.cfg.gdb_host,
+                                                            port=self.cfg.gdb_port)
+                                    _gdb_rst.system_reset()
+                                    _rpath = "OS_REBOOT"
+                                except Exception as _e:
+                                    print(f"  WARNING: system_reset failed ({_e})",
+                                          flush=True)
+                                # Reset M4B after system_reset (NEST component,
+                                # not affected by the QEMU reboot signal).
+                                if self.cfg.nest_url:
+                                    try:
+                                        from nest_client.client import NestClient
+                                        with NestClient(url=self.cfg.nest_url) as _nc:
+                                            _nc.send_command("M4B",
+                                                             "switch_back_to_a7a",
+                                                             "{}")
+                                    except Exception as _e:
+                                        print(f"  WARNING: M4B reset failed ({_e})",
+                                              flush=True)
+                            else:
+                                print("  Waiting for CHESS ready...", flush=True)
+
+                            _ready = ""
+                            _deadline = _t_crash + 120.0
+
+                            _boot_oracle = PtyOracle(self.cfg.pty_log_path,
+                                                     seek_to_end=True)
+                            _boot_oracle.start()
+                            try:
+                                while time.monotonic() < _deadline:
+                                    for line in _boot_oracle.recent_lines(500):
+                                        if not _rpath:
+                                            if _OS_REBOOT_RE.search(line):
+                                                _rpath = "OS_REBOOT"
+                                            elif _FS_RESTART_RE.search(line):
+                                                _rpath = "FS_RESTART"
+                                        if any(kw in line for kw in _FPRIME_BOOT_KW):
+                                            _ready = line.strip()
+                                            break
+                                    if _ready:
+                                        break
+                                    time.sleep(1.0)
+                            finally:
+                                _boot_oracle.stop()
+
+                            _rtime = time.monotonic() - _t_crash
+                            result.recovery_path   = _rpath or "UNKNOWN"
+                            result.recovery_time_s = round(_rtime, 1)
+
+                            if _ready:
+                                print(f"  CHESS ready ({result.recovery_path} "
+                                      f"{result.recovery_time_s:.0f}s): "
+                                      f"{_ready[:200]}", flush=True)
+                            else:
+                                last = _boot_oracle.recent_lines(3)
+                                print(f"  WARNING: CHESS ready timeout "
+                                      f"({result.recovery_path}, "
+                                      f"{result.recovery_time_s:.0f}s). "
+                                      f"Last: {last}", flush=True)
+
                         oracle.drain()
-                        self._append_result(result)
 
-                    else:
-                        self._append_result(result)
+                    self._append_result(result)
 
+              except _StopCampaign:
+                pass  # hook cut the campaign; results collected so far are valid
         finally:
             oracle.stop()
 
@@ -1245,15 +1512,78 @@ class SEUCampaign:
             )
 
     def print_summary(self) -> None:
+        """Unified SEU report - used by both --ci and --ci-debug.
+
+        Outcome categories (top-level):
+          CRASH           - vCPU halted / liveness timeout
+          DETECTED        - FPrime WARN/FATAL event in observation window
+          MASKED          - no event, no crash, Layer-5 clean (truly absorbed)
+          MASKED_CRITICAL - no event, no crash, but Layer-5 found safety-critical
+                            state drift (silent corruption — same severity class
+                            as CRASH for operations / dashboards / alerting)
+          NO_INJECT       - plugin never reported the trigger as fired
+
+        Same format regardless of how injections were scheduled (random
+        bit-flips in --ci vs user-chosen specs in --ci-debug).
+        """
         from collections import Counter
-        counts = Counter(r.outcome for r in self._results)
-        total  = len(self._results)
-        print("\n── SEU Campaign Summary ──────────────────────────────")
-        print(f"  Total injections : {total}")
-        for outcome, n in sorted(counts.items()):
-            pct = 100 * n / total if total else 0
-            print(f"  {outcome:<12} : {n:4d}  ({pct:.1f}%)")
-        print(f"  Results file     : {self.cfg.results_path}")
+        results = self._results
+        total = len(results)
+
+        counts = Counter(r.outcome for r in results)
+        n_crash    = counts.get("CRASH",           0)
+        n_detected = counts.get("DETECTED",        0)
+        n_masked   = counts.get("MASKED",          0)
+        n_critical = counts.get("MASKED_CRITICAL", 0)
+        n_noinject = counts.get("NO_INJECT",       0)
+
+        critical_results = [r for r in results if r.outcome == "MASKED_CRITICAL"]
+
+        # Layer 4: pairwise violations (only meaningful when classify_hook is set)
+        pairwise_violations: list = []
+        hook = self.cfg.classify_hook
+        if hook and hasattr(hook, "violations"):
+            pairwise_violations = list(hook.violations)
+
+        # Effective campaign size for percentages = total minus NO_INJECT
+        # (failed injections aren't real data points).
+        effective = total - n_noinject
+
+        print("\n── SEU Campaign Report ──────────────────────────────")
+        print(f"  Total injections     : {total}")
+        if n_noinject:
+            print(f"    NO_INJECT (failed) : {n_noinject}  "
+                  f"(plugin never reported trigger fired — not real data)")
+            print(f"  Effective injections : {effective}")
+        print(f"   1. CRASH            : {n_crash}")
+        print(f"   2. DETECTED         : {n_detected}")
+        print(f"   3. MASKED           : {n_masked}    (Layer-5 verified - truly absorbed)")
+        print(f"   4. MASKED_CRITICAL  : {n_critical}    (Layer-5 found silent corruption)")
+        print(f"   5. PAIRWISE (state) : {len(pairwise_violations)}  "
+              f"(EA x OBC invariant violation)")
+        print("─────────────────────────────────────────────────────")
+
+        if critical_results:
+            print("\n  MASKED_CRITICAL — silent corruption (Layer-5 divergence):")
+            for r in critical_results:
+                sym = r.spec.symbol or f"0x{r.spec.addr:08x}"
+                fld = f" :: {r.spec.field_name}" if r.spec.field_name else ""
+                print(f"    0x{r.spec.addr:08x} bit={r.spec.bit}  {sym}{fld}")
+                print(f"      → {r.suspect_reason}")
+
+        if pairwise_violations:
+            print("\n  PAIRWISE — EA x OBC state-machine violations:")
+            for v in pairwise_violations:
+                print(f"    {v['addr']} bit={v['bit']}  "
+                      f"OBC={v['obc']} x EA={v['ea_post']}  → {v['verdict']}")
+
+        if effective:
+            print()
+            for outcome in ("CRASH", "DETECTED", "MASKED", "MASKED_CRITICAL"):
+                n = counts.get(outcome, 0)
+                pct = 100 * n / effective
+                print(f"  {outcome:<16} rate : {pct:5.1f}%  (of {effective} effective)")
+        print(f"  Results file        : {self.cfg.results_path}")
         print("─────────────────────────────────────────────────────")
 
 
@@ -1299,7 +1629,7 @@ def _cli() -> None:
             trigger = fi.inject_mem(addr=addr, bit=args.bit, delay=args.delay)
             print(f"Scheduled: addr=0x{addr:08x} bit={args.bit} "
                   f"trigger_insn={trigger:,}")
-            print("Waiting for injection result…")
+            print("Waiting for injection result...")
             r = fi.wait_for_result(timeout=60.0, trigger_insn=trigger)
             if r:
                 print(json.dumps(r, indent=2))
