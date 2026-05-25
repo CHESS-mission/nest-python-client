@@ -704,14 +704,21 @@ def get_stable_component_sample(
     min_per_component: int = 1,
     exclude_re: str | None = None,
     stable_elf_path: Path | None = None,
+    per_component_quota: int | None = None,
 ) -> tuple[list[dict], dict[str, int]]:
     """
-    Physically proportional, version-stable CI sample.
+    Version-stable CI sample.  Two sampling modes:
 
-    total_quota injections are distributed across components proportionally by
-    injectable bytes (larger components get more samples, matching the radiation
-    model within each component's footprint).  Every component gets at least
-    min_per_component injections.
+    1. Proportional (default, per-byte radiation-like).  ``total_quota``
+       injections are distributed across components proportionally by injectable
+       bytes (larger components get more samples).  Every component gets at
+       least ``min_per_component``.  Used by --sweep and by --ci when no
+       per-component cap is requested.
+
+    2. Per-component (set ``per_component_quota=N``).  Each component receives
+       exactly N targets — equal statistical weight per component, regardless
+       of byte size.  ``total_quota`` is ignored.  Used by --ci --per-component
+       to give every component the same regression-detection power.
 
     Targets are keyed by (symbol_name, field_name, bit_within_field) — the same
     stable key that SEUResultDB uses for cross-version comparison.  If BSS
@@ -834,19 +841,24 @@ def get_stable_component_sample(
     total_bytes = sum(comp_bytes.values())
     n_comps = len(comp_units)
 
-    # Distribute total_quota proportionally; guaranteed floor per component
-    guaranteed = n_comps * min_per_component
-    extra_pool = max(0, total_quota - guaranteed)
+    # Distribute quota across components — per-component mode wins if set,
+    # otherwise proportional-by-injectable-bytes with a guaranteed min floor.
     comp_quotas: dict[str, int] = {}
-    for comp in sorted(comp_units):
-        frac = comp_bytes[comp] / total_bytes if total_bytes else 1 / n_comps
-        comp_quotas[comp] = min_per_component + round(extra_pool * frac)
+    if per_component_quota is not None and per_component_quota > 0:
+        for comp in sorted(comp_units):
+            comp_quotas[comp] = per_component_quota
+    else:
+        guaranteed = n_comps * min_per_component
+        extra_pool = max(0, total_quota - guaranteed)
+        for comp in sorted(comp_units):
+            frac = comp_bytes[comp] / total_bytes if total_bytes else 1 / n_comps
+            comp_quotas[comp] = min_per_component + round(extra_pool * frac)
 
-    # Correct rounding drift so sum == total_quota
-    delta = total_quota - sum(comp_quotas.values())
-    if delta != 0:
-        anchor = max(comp_quotas, key=lambda c: comp_bytes[c])
-        comp_quotas[anchor] = max(min_per_component, comp_quotas[anchor] + delta)
+        # Correct rounding drift so sum == total_quota
+        delta = total_quota - sum(comp_quotas.values())
+        if delta != 0:
+            anchor = max(comp_quotas, key=lambda c: comp_bytes[c])
+            comp_quotas[anchor] = max(min_per_component, comp_quotas[anchor] + delta)
 
     # Generate stable targets
     targets: list[dict] = []
