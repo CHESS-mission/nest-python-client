@@ -1202,6 +1202,65 @@ class SEUCampaign:
         _OS_REBOOT_RE   = re.compile(r"Kernel panic|Oops:|BUG: Bad page",
                                      re.IGNORECASE)
 
+        def _force_full_reset(result):
+            # Used when per-byte revert can't guarantee independence (revert
+            # failed, NO_INJECT, CRASH, DETECTED): fire system_reset, reset
+            # the M4B mux, then wait for CHESS to come back up.
+            _t_crash = time.monotonic()
+            _rpath = ""
+            if self.cfg.gdb_host:
+                print("  Forcing system_reset for next-injection independence...",
+                      flush=True)
+                try:
+                    _gdb_rst = GdbMemWriter(host=self.cfg.gdb_host,
+                                            port=self.cfg.gdb_port)
+                    _gdb_rst.system_reset()
+                    _rpath = "OS_REBOOT"
+                except Exception as _e:
+                    print(f"  WARNING: system_reset failed ({_e})", flush=True)
+                if self.cfg.nest_url:
+                    try:
+                        from nest_client.client import NestClient
+                        with NestClient(url=self.cfg.nest_url) as _nc:
+                            _nc.send_command("M4B",
+                                             "switch_back_to_a7a", "{}")
+                    except Exception as _e:
+                        print(f"  WARNING: M4B reset failed ({_e})",
+                              flush=True)
+            _ready = ""
+            _deadline = _t_crash + 120.0
+            _boot_oracle = PtyOracle(self.cfg.pty_log_path, seek_to_end=True)
+            _boot_oracle.start()
+            try:
+                while time.monotonic() < _deadline:
+                    for line in _boot_oracle.recent_lines(500):
+                        if not _rpath:
+                            if _OS_REBOOT_RE.search(line):
+                                _rpath = "OS_REBOOT"
+                            elif _FS_RESTART_RE.search(line):
+                                _rpath = "FS_RESTART"
+                        if any(kw in line for kw in _FPRIME_BOOT_KW):
+                            _ready = line.strip()
+                            break
+                    if _ready:
+                        break
+                    time.sleep(1.0)
+            finally:
+                _boot_oracle.stop()
+            _rtime = time.monotonic() - _t_crash
+            result.recovery_path   = _rpath or "UNKNOWN"
+            result.recovery_time_s = round(_rtime, 1)
+            if _ready:
+                print(f"  CHESS ready ({result.recovery_path} "
+                      f"{result.recovery_time_s:.0f}s): {_ready[:200]}",
+                      flush=True)
+            else:
+                last = _boot_oracle.recent_lines(3)
+                print(f"  WARNING: CHESS ready timeout "
+                      f"({result.recovery_path}, "
+                      f"{result.recovery_time_s:.0f}s). Last: {last}",
+                      flush=True)
+
         try:
             with FaultInjectorClient(self.cfg.socket_path) as client:
               try:
@@ -1321,90 +1380,32 @@ class SEUCampaign:
                             # reverted, otherwise the persistent corruption
                             # cascades into every subsequent Layer-5 check and
                             # produces false "everything diverged" alarms.
+                            _revert_ok = False
                             if self.cfg.gdb_host:
                                 try:
                                     _gdb_r = GdbMemWriter(host=self.cfg.gdb_host,
                                                           port=self.cfg.gdb_port)
-                                    _ok = _gdb_r.write_byte(spec.addr, result.original)
+                                    _revert_ok = _gdb_r.write_byte(spec.addr, result.original)
                                     print(f"  Restored 0x{result.flipped:02x}->"
                                           f"0x{result.original:02x} at "
                                           f"0x{spec.addr:08x}  "
-                                          f"({'ok' if _ok else 'FAILED - next injection not independent'})",
+                                          f"({'ok' if _revert_ok else 'FAILED — escalating to system_reset'})",
                                           flush=True)
                                 except Exception as _e:
                                     print(f"  WARNING: GDB restore failed ({_e})",
                                           flush=True)
+                            if not _revert_ok:
+                                # Per-byte revert can't guarantee independence
+                                # (CPU halted, kernel context, GDB unreachable).
+                                # Fall through to a full reboot so the next
+                                # injection starts from a known-clean state.
+                                _force_full_reset(result)
 
                         else:
-                            # Fallback: wait for FPrime/Phoenix to restart CHESS.
-                            # For CRASH outcomes with a GDB host, force a clean
-                            # VM reboot via system_reset - Phoenix's auto-restart
-                            # can get stuck in a crash loop that never clears.
-                            _t_crash = time.monotonic()
-                            _rpath = "" if result.outcome == "CRASH" else "NONE"
-
-                            if result.outcome == "CRASH" and self.cfg.gdb_host:
-                                print("  CRASH - sending system_reset...", flush=True)
-                                try:
-                                    _gdb_rst = GdbMemWriter(host=self.cfg.gdb_host,
-                                                            port=self.cfg.gdb_port)
-                                    _gdb_rst.system_reset()
-                                    _rpath = "OS_REBOOT"
-                                except Exception as _e:
-                                    print(f"  WARNING: system_reset failed ({_e})",
-                                          flush=True)
-                                # Reset M4B after system_reset (NEST component,
-                                # not affected by the QEMU reboot signal).
-                                if self.cfg.nest_url:
-                                    try:
-                                        from nest_client.client import NestClient
-                                        with NestClient(url=self.cfg.nest_url) as _nc:
-                                            _nc.send_command("M4B",
-                                                             "switch_back_to_a7a",
-                                                             "{}")
-                                    except Exception as _e:
-                                        print(f"  WARNING: M4B reset failed ({_e})",
-                                              flush=True)
-                            else:
-                                print("  Waiting for CHESS ready...", flush=True)
-
-                            _ready = ""
-                            _deadline = _t_crash + 120.0
-
-                            _boot_oracle = PtyOracle(self.cfg.pty_log_path,
-                                                     seek_to_end=True)
-                            _boot_oracle.start()
-                            try:
-                                while time.monotonic() < _deadline:
-                                    for line in _boot_oracle.recent_lines(500):
-                                        if not _rpath:
-                                            if _OS_REBOOT_RE.search(line):
-                                                _rpath = "OS_REBOOT"
-                                            elif _FS_RESTART_RE.search(line):
-                                                _rpath = "FS_RESTART"
-                                        if any(kw in line for kw in _FPRIME_BOOT_KW):
-                                            _ready = line.strip()
-                                            break
-                                    if _ready:
-                                        break
-                                    time.sleep(1.0)
-                            finally:
-                                _boot_oracle.stop()
-
-                            _rtime = time.monotonic() - _t_crash
-                            result.recovery_path   = _rpath or "UNKNOWN"
-                            result.recovery_time_s = round(_rtime, 1)
-
-                            if _ready:
-                                print(f"  CHESS ready ({result.recovery_path} "
-                                      f"{result.recovery_time_s:.0f}s): "
-                                      f"{_ready[:200]}", flush=True)
-                            else:
-                                last = _boot_oracle.recent_lines(3)
-                                print(f"  WARNING: CHESS ready timeout "
-                                      f"({result.recovery_path}, "
-                                      f"{result.recovery_time_s:.0f}s). "
-                                      f"Last: {last}", flush=True)
+                            # NO_INJECT / CRASH / DETECTED / MASKED-without-success:
+                            # state is known-broken or unreliable. Force a full
+                            # VM reboot so the next injection is truly independent.
+                            _force_full_reset(result)
 
                         oracle.drain()
 
