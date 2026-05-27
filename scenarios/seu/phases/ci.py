@@ -223,6 +223,16 @@ def run_ci(args) -> None:
 
     from nest_client.seu.result_db import SEUResultDB
     with SEUResultDB(SEU_DB) as db:
+        # No explicit --baseline: auto-compare against the most recent prior
+        # run built from the same binary, so every run produces a regression
+        # report against the previous entry without manual baseline promotion.
+        if not baseline:
+            auto = db.previous_run(run_id, same_binary=True)
+            if auto:
+                baseline = auto
+                print(f"  Auto-baseline: comparing against previous run "
+                      f"{baseline[:8]} (same binary)")
+
         db.print_masked_rates(run_id, compare_run_id=baseline, filter_prefix=ci_filter)
 
         if baseline:
@@ -246,5 +256,5 @@ def run_ci(args) -> None:
             else:
                 print(f"\n  CI PASSED — all components within +{threshold*100:.0f}%.")
         else:
-            print(f"\n  No baseline — results recorded as run_id: {run_id[:8]}")
-            print("  Re-run with --baseline <run_id> to enable regression detection.")
+            print(f"\n  No prior run for this binary — results recorded as run_id: {run_id[:8]}")
+            print("  The next run will auto-compare against this one.")

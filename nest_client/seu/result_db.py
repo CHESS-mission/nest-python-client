@@ -369,6 +369,27 @@ class SEUResultDB:
             raise ValueError(f"Ambiguous prefix '{run_id}' matches: {ids}")
         return None
 
+    def previous_run(self, run_id: str, same_binary: bool = True) -> str | None:
+        """run_id of the most recent run *before* `run_id` (by timestamp).
+
+        With same_binary=True (default), restrict to runs built from the same
+        binary (identical binary_hash) so a masked-rate comparison is
+        apples-to-apples — symbol layout shifts between builds otherwise.
+        Returns None if there is no prior run to compare against.
+        """
+        meta = self.get_run(run_id)
+        if meta is None:
+            return None
+        rid = meta["run_id"]
+        q = "SELECT run_id FROM runs WHERE run_id != ? AND timestamp < ?"
+        params: list = [rid, meta["timestamp"]]
+        if same_binary:
+            q += " AND binary_hash = ?"
+            params.append(meta["binary_hash"])
+        q += " ORDER BY timestamp DESC LIMIT 1"
+        row = self._con.execute(q, params).fetchone()
+        return row["run_id"] if row else None
+
     def list_runs(self, limit: int = 20) -> list[sqlite3.Row]:
         return self._con.execute(
             "SELECT r.*, COUNT(res.id) AS n_results "
