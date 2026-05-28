@@ -113,6 +113,21 @@ def main() -> None:
                              "--vtable-skip 0 to include those targets — recommended for "
                              "radiation-realistic --sweep runs where you want CRASH outcomes "
                              "to appear in the distribution.")
+    # --batch group-testing sweep
+    parser.add_argument("--batch", action="store_true",
+                        help="--ci / --sweep: group-testing batch mode.  Pools multiple "
+                             "flips per observation (masked-dominated => big speedup), "
+                             "bisects positive batches to isolate culprit(s), and "
+                             "re-confirms each interesting outcome for reproducibility.")
+    parser.add_argument("--batch-init", type=int, default=2, metavar="N",
+                        help="--batch: initial batch size (default 2)")
+    parser.add_argument("--batch-max", type=int, default=16, metavar="N",
+                        help="--batch: batch-size cap (default 16)")
+    parser.add_argument("--batch-grow", type=int, default=2, metavar="N",
+                        help="--batch: additive batch-size growth per all-masked batch (default 2)")
+    parser.add_argument("--reproduce", type=int, default=1, metavar="K",
+                        help="--batch: re-confirm each isolated CRASH/DETECTED/MASKED_CRITICAL "
+                             "K times from clean state (default 1)")
     # --ci-debug target specs
     parser.add_argument("--targets", nargs="+", metavar="SPEC",
                         help="--ci-debug: space-separated target specs. "

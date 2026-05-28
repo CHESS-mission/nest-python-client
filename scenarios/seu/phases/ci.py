@@ -208,7 +208,16 @@ def run_ci(args) -> None:
         )
         for t in targets
     ]
-    campaign.run_targets(specs)
+    if getattr(args, "batch", False):
+        campaign.run_batch_sweep(
+            specs=specs,
+            init_batch=getattr(args, "batch_init", 2),
+            max_batch=getattr(args, "batch_max", 16),
+            grow=getattr(args, "batch_grow", 2),
+            reproduce_k=getattr(args, "reproduce", 1),
+        )
+    else:
+        campaign.run_targets(specs)
     campaign.print_summary()
 
     # Pairwise gate: fail immediately if any injection produced INCONSISTENT.

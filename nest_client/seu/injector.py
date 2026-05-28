@@ -1474,6 +1474,331 @@ class SEUCampaign:
 
         return results
 
+    # ------------------------------------------------------------------
+    # Batch sweep (group testing)
+    #
+    # Masked-dominated sweeps waste time testing one flip at a time.  Instead
+    # we pool several flips into a batch, apply them all from a clean state,
+    # and observe one aggregate outcome:
+    #   - batch MASKED  -> attribute MASKED to every flip in it (cheap coverage)
+    #   - batch CRASH/DETECTED/MASKED_CRITICAL -> bisect to isolate the
+    #     culprit(s), then re-confirm each for reproducibility.
+    # Batch size grows additively while batches keep masking and drops back to
+    # the floor after a positive batch (TCP-style).
+    # ------------------------------------------------------------------
+
+    _INTERESTING = ("CRASH", "DETECTED", "MASKED_CRITICAL")
+
+    def _reset_and_wait(self, timeout: float = 120.0) -> str:
+        """system_reset + M4B mux reset, then wait for FPrime to boot.
+
+        Gives the next batch a known-clean starting state.  Returns the
+        recovery_path label ("OS_REBOOT" / "FS_RESTART").
+        """
+        _BOOT_KW = [kw for kw in CHESS_READY_KEYWORDS
+                    if kw != "CHESS_Pathfinder0FS"]
+        t0 = time.monotonic()
+        if self.cfg.gdb_host:
+            try:
+                GdbMemWriter(host=self.cfg.gdb_host,
+                             port=self.cfg.gdb_port).system_reset()
+            except Exception as _e:
+                print(f"  WARNING: system_reset failed ({_e})", flush=True)
+            if self.cfg.nest_url:
+                try:
+                    from nest_client.client import NestClient
+                    with NestClient(url=self.cfg.nest_url) as _nc:
+                        _nc.send_command("M4B", "switch_back_to_a7a", "{}")
+                except Exception as _e:
+                    print(f"  WARNING: M4B reset failed ({_e})", flush=True)
+        boot = PtyOracle(self.cfg.pty_log_path, seek_to_end=True)
+        boot.start()
+        ready = ""
+        try:
+            while time.monotonic() < t0 + timeout:
+                for line in boot.recent_lines(500):
+                    if any(kw in line for kw in _BOOT_KW):
+                        ready = line.strip()
+                        break
+                if ready:
+                    break
+                time.sleep(1.0)
+        finally:
+            boot.stop()
+        if not ready:
+            print(f"  WARNING: CHESS not ready {time.monotonic()-t0:.0f}s "
+                  "after reset", flush=True)
+        return "OS_REBOOT"
+
+    def _apply_flip(self, client: "FaultInjectorClient",
+                    spec: InjectionSpec) -> tuple[bool, int, int, int]:
+        """Apply one bit flip and wait for it to land (no observation).
+
+        Returns (success, original, flipped, trigger_insn).
+        """
+        trigger = client.inject_mem(addr=spec.addr, bit=spec.bit,
+                                    delay=spec.delay)
+        # Small delay (1M insns) -> lands in ~1-2s; cap the wait so a flip that
+        # never lands (vCPU already halted by an earlier flip) fails fast.
+        fire_timeout = max(15.0, spec.delay / 300_000 + 5.0)
+        resp = client.wait_for_result(timeout=fire_timeout, trigger_insn=trigger)
+        if resp is None:
+            return (False, 0, 0, trigger)
+        success  = bool(resp.get("success", False))
+        original = int(resp.get("original", 0))
+        flipped  = int(resp.get("flipped",  0))
+        if not success and self.cfg.gdb_host and flipped != original:
+            try:
+                success = GdbMemWriter(
+                    host=self.cfg.gdb_host,
+                    port=self.cfg.gdb_port).write_byte(spec.addr, flipped)
+            except Exception:
+                pass
+        return (success, original, flipped, trigger)
+
+    def _observe_state(self, client: "FaultInjectorClient",
+                       oracle: "PtyOracle") -> dict:
+        """Classify the current VM state — same logic as _run_one's verdict."""
+        oracle.drain()
+        if self.cfg.use_insn_count_liveness:
+            c0 = client.get_count()
+            time.sleep(self.cfg.observation_window_s)
+            c1 = client.get_count()
+            delta = c1 - c0
+            alive = delta > 1_000_000
+            return {"outcome": "MASKED" if alive else "CRASH",
+                    "evidence": f"insn delta={delta:,} "
+                                f"({'alive' if alive else 'halted'})",
+                    "last_events": []}
+        c0 = client.get_count()
+        time.sleep(2.0)
+        c1 = client.get_count()
+        if (c1 - c0) < 500_000:
+            return {"outcome": "CRASH",
+                    "evidence": f"insn delta={c1-c0:,} over 2s - vCPU halted",
+                    "last_events": []}
+        return oracle.classify(self.cfg.observation_window_s * 0.5)
+
+    def _evaluate_batch(self, client: "FaultInjectorClient",
+                        oracle: "PtyOracle",
+                        batch: list[InjectionSpec]
+                        ) -> tuple[str, dict, list]:
+        """Reset to clean, apply every flip in `batch`, then observe once.
+
+        Returns (outcome, verdict, applied) where applied is a list of
+        (spec, success, original, flipped, trigger) tuples.
+        """
+        self._reset_and_wait()
+        oracle.drain()
+        applied = []
+        crashed_mid = False
+        for spec in batch:
+            success, orig, flip, trig = self._apply_flip(client, spec)
+            applied.append((spec, success, orig, flip, trig))
+            if not success:
+                # A flip that won't land usually means an earlier flip already
+                # halted the vCPU.  Confirm liveness; if dead, stop applying.
+                c0 = client.get_count()
+                time.sleep(1.0)
+                if (client.get_count() - c0) < 200_000:
+                    crashed_mid = True
+                    break
+        if crashed_mid:
+            verdict = {"outcome": "CRASH",
+                       "evidence": "vCPU halted during batch apply",
+                       "last_events": []}
+        else:
+            verdict = self._observe_state(client, oracle)
+
+        # Layer-5 golden integrity: promote a MASKED batch to MASKED_CRITICAL
+        # if a safety-critical parameter silently drifted.
+        if verdict["outcome"] == "MASKED" and self.cfg.critical_params:
+            try:
+                from nest_client.seu.critical_params import check_critical_params
+                diverged = check_critical_params(
+                    self.cfg.critical_params,
+                    GdbMemWriter(host=self.cfg.gdb_host, port=self.cfg.gdb_port))
+                if diverged:
+                    n, exp, act = diverged[0]
+                    verdict["outcome"] = "MASKED_CRITICAL"
+                    verdict["evidence"] = (f"critical param diverged: {n} "
+                                           f"expected={exp} got={act}")
+            except Exception as _e:
+                print(f"  WARNING: Layer-5 check failed ({_e})", flush=True)
+        return verdict["outcome"], verdict, applied
+
+    def _find_one_culprit(self, client, oracle, group: list[InjectionSpec]
+                          ) -> tuple[Optional[InjectionSpec], dict]:
+        """Binary-search a group known to be interesting down to one culprit."""
+        cur = list(group)
+        verdict: dict = {}
+        while len(cur) > 1:
+            mid = len(cur) // 2
+            left = cur[:mid]
+            out, verdict, _ = self._evaluate_batch(client, oracle, left)
+            print(f"    bisect: tested {len(left)}/{len(cur)} -> {out}",
+                  flush=True)
+            cur = left if out in self._INTERESTING else cur[mid:]
+        out, verdict, _ = self._evaluate_batch(client, oracle, cur)
+        if out in self._INTERESTING:
+            return cur[0], verdict
+        # Single-flip re-test came back clean (flaky) -> no stable culprit.
+        return None, verdict
+
+    def _bisect(self, client, oracle, batch: list[InjectionSpec]
+                ) -> list[tuple[InjectionSpec, str, dict]]:
+        """Hybrid isolation: binary-search one culprit, then re-test the
+        remainder and recurse only if it's still interesting (multi-culprit)."""
+        culprits: list[tuple[InjectionSpec, str, dict]] = []
+        work = list(batch)
+        while work:
+            culprit, verdict = self._find_one_culprit(client, oracle, work)
+            if culprit is None:
+                break
+            culprits.append((culprit, verdict["outcome"], verdict))
+            work = [s for s in work if s is not culprit]
+            if not work:
+                break
+            out, _v, _a = self._evaluate_batch(client, oracle, work)
+            if out not in self._INTERESTING:
+                break  # remainder masks cleanly -> all other culprits found
+        return culprits
+
+    def _reproduce(self, client, oracle, spec: InjectionSpec,
+                   expected: str, k: int = 1) -> str:
+        """Re-run `spec` alone k times; return a 'matches/k' ratio string."""
+        matches = 0
+        for _ in range(max(1, k)):
+            out, _v, _a = self._evaluate_batch(client, oracle, [spec])
+            if out == expected:
+                matches += 1
+        return f"{matches}/{max(1, k)}"
+
+    def run_batch_sweep(self,
+                        specs: list[InjectionSpec] | None = None,
+                        max_targets: int | None = None,
+                        init_batch: int = 2,
+                        max_batch: int = 16,
+                        grow: int = 2,
+                        reproduce_k: int = 1) -> list[InjectionResult]:
+        """Group-testing sweep: pool flips into batches, isolate culprits.
+
+        Masked batches cover every flip in them at the cost of one observation;
+        positive batches are bisected (hybrid binary search) to the culprit(s)
+        and each culprit is re-confirmed `reproduce_k` times.  Batch size grows
+        by `grow` (additive) up to `max_batch` while masking, and resets to
+        `init_batch` after a positive batch.
+
+        ``specs`` may be supplied by a caller (e.g. the --ci/--sweep phase,
+        which has already done the stable-ELF address remap and started a DB
+        run); when omitted, targets are built from the ELF and a DB run is
+        started here.
+        """
+        _own_db = False
+        if specs is None:
+            from nest_client.seu.elf_analyzer import get_injection_targets
+            filter_re = (re.compile(self.cfg.filter_re)
+                         if self.cfg.filter_re else None)
+            targets = get_injection_targets(
+                self.cfg.elf_path,
+                candidates_only=self.cfg.candidates_only,
+                filter_re=filter_re,
+            )
+            if max_targets:
+                targets = targets[:max_targets]
+            specs = [InjectionSpec(addr=t["addr"], bit=t["bit"],
+                                   delay=self.cfg.delay_insn,
+                                   symbol=t.get("symbol", ""),
+                                   byte_offset=t.get("byte_offset", 0))
+                     for t in targets]
+            if self.cfg.db_path and not self._run_id:
+                from nest_client.seu.result_db import SEUResultDB
+                self._db = SEUResultDB(self.cfg.db_path)
+                self._run_id = self._db.start_run(
+                    elf_path=self.cfg.elf_path, topology="batch_sweep",
+                    notes=f"batch sweep init={init_batch} max={max_batch}")
+                _own_db = True
+        else:
+            specs = list(specs)
+        print(f"Batch sweep: {len(specs)} flips  "
+              f"(batch {init_batch}->{max_batch} +{grow}, reproduce x{reproduce_k})")
+
+        oracle = PtyOracle(self.cfg.pty_log_path)
+        oracle.start()
+        if self.cfg.liveness_timeout_s is not None:
+            oracle.LIVENESS_TIMEOUT_S = self.cfg.liveness_timeout_s
+
+        results: list[InjectionResult] = []
+
+        def _record(spec, success, orig, flip, trig, outcome, evidence,
+                    last_events=None):
+            r = InjectionResult(spec=spec, trigger_insn=trig, success=success,
+                                 original=orig, flipped=flip, elapsed_s=0.0,
+                                 outcome=outcome, evidence=evidence,
+                                 last_events=last_events or [])
+            results.append(r)
+            self._append_result(r)
+            return r
+
+        i = 0
+        batch_size = init_batch
+        batch_id = 0
+        try:
+            with FaultInjectorClient(self.cfg.socket_path) as client:
+                client.wait_for_socket()
+                while i < len(specs):
+                    batch = specs[i:i + batch_size]
+                    i += len(batch)
+                    batch_id += 1
+                    print(f"\n[batch {batch_id}] {len(batch)} flips "
+                          f"({i}/{len(specs)} targets)", flush=True)
+                    out, verdict, applied = self._evaluate_batch(
+                        client, oracle, batch)
+
+                    if out not in self._INTERESTING:
+                        for spec, success, orig, flip, trig in applied:
+                            _record(spec, success, orig, flip, trig, out,
+                                    f"batch#{batch_id} pool-{out.lower()} "
+                                    f"(n={len(batch)})")
+                        batch_size = min(max_batch, batch_size + grow)
+                        print(f"  -> {out}: {len(applied)} flips covered; "
+                              f"batch_size -> {batch_size}", flush=True)
+                    else:
+                        print(f"  -> {out}: bisecting {len(batch)} flips...",
+                              flush=True)
+                        culprits = self._bisect(client, oracle, batch)
+                        culprit_ids = {id(c[0]) for c in culprits}
+                        for spec, c_out, c_v in culprits:
+                            ratio = self._reproduce(client, oracle, spec,
+                                                    c_out, k=reproduce_k)
+                            _record(spec, True, 0, 0, 0, c_out,
+                                    f"batch#{batch_id} isolated "
+                                    f"reproduce={ratio}; "
+                                    f"{c_v.get('evidence','')}",
+                                    c_v.get("last_events"))
+                            print(f"  isolated {spec.symbol}+{spec.byte_offset}"
+                                  f" bit{spec.bit}: {c_out} "
+                                  f"reproduce={ratio}", flush=True)
+                        for spec, success, orig, flip, trig in applied:
+                            if id(spec) not in culprit_ids:
+                                _record(spec, success, orig, flip, trig,
+                                        "MASKED",
+                                        f"batch#{batch_id} non-culprit "
+                                        "(masked once culprit removed)")
+                        if not culprits:
+                            print("  WARNING: batch was interesting but no "
+                                  "stable culprit isolated (flaky)", flush=True)
+                        batch_size = init_batch  # AIMD: drop to floor
+                        print(f"  batch_size -> {batch_size} (positive batch)",
+                              flush=True)
+        finally:
+            oracle.stop()
+
+        if _own_db and self._db and self._run_id:
+            self._db.print_run_summary(self._run_id)
+            self._db.close()
+        return results
+
     # Result persistence
 
     def _append_result(self, result: InjectionResult) -> None:
