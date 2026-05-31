@@ -1,0 +1,9 @@
+components:
+  - name: Satnogs
+    type: wasm
+    config:
+      module: component_artifacts/satnogs.wasm
+    ports:
+      system:
+        - name: uart
+          type: bytes
