@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from pathlib import Path
 from typing import Union
@@ -11,6 +12,7 @@ import numpy as np
 from nest_client.seu.injector import (
     CHESS_READY_KEYWORDS,
     FaultInjectorClient,
+    GdbMemWriter,
     PtyOracle,
     restart_chess_in_qemu,
 )
@@ -150,6 +152,68 @@ def print_banner(title: str) -> None:
     print("\n" + "─" * w)
     print(f"  {title}")
     print("─" * w)
+
+
+# Beacon readiness (shared by --ci, --sweep, --code, --ci-debug)
+
+_PAYLOAD_RE = re.compile(r"PACKET_SENT\s*:\s*Packet sent with payload\s+(\d+)")
+# PACKET_SENT lines carry a kernel timestamp ("[   74.790939] ... PACKET_SENT ...")
+# from /dev/kmsg that advances whenever CHESS emits a beacon, regardless of the
+# payload VALUE.  Older builds beaconed an integer counter; newer builds beacon a
+# float sensor reading (e.g. "payload -0.125000"), which breaks payload-counter
+# liveness.  Keying on the timestamp is format-agnostic and works for both.
+_BEACON_TS_RE = re.compile(r"\[\s*(\d+\.\d+)\].*PACKET_SENT")
+
+
+def wait_for_beacon(oracle: PtyOracle, timeout_s: float = 120.0,
+                    window_s: float = 5.0, min_advance: int = 2) -> bool:
+    """Block until the PACKET_SENT heartbeat is *actively advancing*.
+
+    Counting EVENT: lines in the buffer passes on stale boot-diagnostic events
+    even while the FS is quiet; a *fresh* PACKET_SENT line (its kernel timestamp
+    advancing within the window) proves CHESS is emitting now.  Gating golden
+    capture / the Layer-5 build / injection arming on this avoids them running
+    against a still-booting, quiet FS.
+
+    Returns True once the beacon's timestamp advances by >= ~min_advance guest
+    seconds within window_s (payload-format agnostic: int counter or float value).
+    """
+    def _last_beacon_ts():
+        vals = [float(m.group(1)) for l in oracle.recent_lines(400)
+                if l and (m := _BEACON_TS_RE.search(l))]
+        return vals[-1] if vals else None
+
+    need = max(1.0, float(min_advance) * 0.75)  # ~min_advance beacons at ~1 Hz
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        t0 = _last_beacon_ts()
+        time.sleep(window_s)
+        t1 = _last_beacon_ts()
+        if t0 is not None and t1 is not None and (t1 - t0) >= need:
+            return True
+    return False
+
+
+def ensure_beacon(oracle: PtyOracle, gdb_host: str | None,
+                  initial_wait_s: float = 30.0,
+                  post_reset_wait_s: float = 120.0) -> bool:
+    """Guarantee CHESS is beaconing; reset a stuck no_phoenix boot to recover.
+
+    The initial boot is unreliable - CHESS sometimes never reaches steady state
+    (Health uninitialised, no PACKET_SENT) and, with Phoenix masked, cannot self-
+    recover.  A system_reset reliably brings it up (the same recovery the per-
+    injection path uses).  Probe briefly; if stuck, reset once and wait again.
+    """
+    if wait_for_beacon(oracle, timeout_s=initial_wait_s):
+        return True
+    print("  Beacon stuck at boot — issuing system_reset to recover…", flush=True)
+    if gdb_host:
+        try:
+            GdbMemWriter(host=gdb_host, port=1234).system_reset()
+        except Exception as _e:
+            print(f"  WARNING: recovery system_reset failed ({_e})", flush=True)
+    oracle.drain()
+    return wait_for_beacon(oracle, timeout_s=post_reset_wait_s)
 
 
 # Liveness / classification

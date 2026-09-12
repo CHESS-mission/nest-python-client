@@ -35,13 +35,11 @@ Typical use (automated Phase 2)
 from __future__ import annotations
 
 import json
-import os
 import re
 import socket
 import struct
 import time
 import threading
-import dataclasses
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -220,9 +218,16 @@ class GdbMemWriter:
         results: list[bytes] = []
         try:
             with self._session() as (s, _):
-                # Select CPU_A (thread 1) so memory ops target CHESS, not CPU_B/M4A.
-                s.sendall(self._pkt("Hg1"))
-                self._recv_pkt(s, timeout=1.0)
+                # Seek a context where CHESS's pages are mapped before the ops, so
+                # the write + verify + extra reads all land in CHESS userspace
+                # (not a kernel/idle halt where the page is unmapped).
+                probe = (writes[0][0] if writes
+                         else (reads[0][0] if reads else None))
+                if probe is not None:
+                    self._seek_mapped(s, probe)
+                else:
+                    s.sendall(self._pkt("Hg1"))
+                    self._recv_pkt(s, timeout=1.0)
                 for addr, value in writes:
                     le_hex = struct.pack("<I", value).hex()
                     s.sendall(self._pkt(f"M{addr:x},4:{le_hex}"))
@@ -267,9 +272,15 @@ class GdbMemWriter:
         results: list[bytes] = []
         try:
             with self._session() as (s, _):
-                # Select CPU_A (thread 1) so reads target CHESS, not CPU_B/M4A.
-                s.sendall(self._pkt("Hg1"))
-                self._recv_pkt(s, timeout=1.0)
+                # Seek a context where CHESS's pages are mapped before reading.
+                # _seek_mapped selects CPU_A and leaves the CPU halted in-context;
+                # this is what lets the critical-params / health npe reads land
+                # instead of returning empty from a kernel/idle halt.
+                if reads:
+                    self._seek_mapped(s, reads[0][0])
+                else:
+                    s.sendall(self._pkt("Hg1"))
+                    self._recv_pkt(s, timeout=1.0)
                 for addr, length in reads:
                     s.sendall(self._pkt(f"m{addr:x},{length:x}"))
                     # Timeout scaled to data size; minimum 2 s
@@ -362,52 +373,137 @@ class GdbMemWriter:
         except Exception:
             pass
 
-    def write_byte(self, addr: int, value: int, max_retries: int = 30) -> bool:
-        """
-        Halt QEMU, overwrite the byte at *addr* with *value*, read it back to
-        verify, then resume.  Retries up to *max_retries* times if the read-back
-        doesn't match — handles the common case where GDB halts the CPU in
-        kernel context, the protocol-level write returns "OK", but the byte
-        didn't actually land because the user-space page wasn't currently
-        mapped.
+    @staticmethod
+    def _is_byte(resp: str) -> bool:
+        """True if *resp* is a single-byte GDB read reply (2 hex chars), not an
+        error packet ("Exx") or empty/timeout."""
+        return (bool(resp) and len(resp) == 2
+                and all(c in "0123456789abcdefABCDEF" for c in resp))
 
-        Returns True only if a read-back confirms the value landed; False if
-        every retry attempt failed or hit an exception.
+    def _addr_mapped(self, s: socket.socket, addr: int) -> bool:
+        """True if a 1-byte read of *addr* succeeds in the CPU's *current* MMU
+        context (i.e. the CHESS process is scheduled and its page is mapped)."""
+        s.sendall(self._pkt("Hg1"))            # target CPU_A / CHESS
+        self._recv_pkt(s, timeout=0.5)
+        s.sendall(self._pkt(f"m{addr:x},1"))
+        return self._is_byte(self._recv_pkt(s, timeout=1.0))
+
+    def _resample_context(self, s: socket.socket) -> None:
+        """Let the guest run briefly, then re-halt, to sample a fresh CPU/MMU
+        context.  CHESS user pages are only mapped while CHESS is the scheduled
+        process; this advances execution so a later halt can catch that window."""
+        s.sendall(self._pkt("c"))
+        time.sleep(0.03)
+        s.sendall(b"\x03")                     # async interrupt -> re-halt
+        self._recv_pkt(s, timeout=0.5)         # consume the stop reply
+
+    def _seek_mapped(self, s: socket.socket, probe_addr: int,
+                     budget: int = 40) -> bool:
+        """Continue/interrupt-sample until *probe_addr* is mapped in the CPU's
+        current MMU context (CHESS scheduled).  On success the CPU is left halted
+        in that context with thread CPU_A selected, ready for reads/writes.
+        Best-effort: on False the caller proceeds anyway and its higher-level
+        retry copes."""
+        for _ in range(budget):
+            if self._addr_mapped(s, probe_addr):
+                return True
+            self._resample_context(s)
+        return False
+
+    def write_byte(self, addr: int, value: int, max_retries: int = 30,
+                   seek_budget: int = 40) -> bool:
+        """
+        Write *value* to the byte at *addr* in the correct MMU context, verifying
+        by read-back.
+
+        The GDB stub reads/writes through the *currently scheduled* process's page
+        tables.  CHESS's .bss/.data pages are only mapped while CHESS is the
+        current process; if GDB halts in the idle task, the kernel, or another
+        process (getty/init), the write silently misses (page unmapped) and the
+        read-back fails.  Rather than writing blindly at a random context and
+        retrying, we first *seek* a context where *addr* is mapped — continue /
+        interrupt-sampling until a read of *addr* succeeds — then write and verify
+        atomically within that same halt.  This is the GDB-side equivalent of the
+        plugin's ``direct_write=YES`` path and fixes the high ``ok=False`` rate on
+        live writable-region targets.
+
+        Returns True only if a read-back confirms the value landed.
         """
         for attempt in range(max_retries):
             try:
                 with self._session() as (s, _):
-                    # Select CPU_A (thread 1) so the write targets CHESS, not
-                    # CPU_B/M4A.  Matches writes_and_reads()'s context handling.
-                    s.sendall(self._pkt("Hg1"))
-                    self._recv_pkt(s, timeout=1.0)
-                    # Write
-                    s.sendall(self._pkt(f"M{addr:x},1:{value:02x}"))
-                    self._recv_pkt(s, timeout=2.0)
-                    # Verify by reading back the same byte
-                    s.sendall(self._pkt(f"m{addr:x},1"))
-                    resp = self._recv_pkt(s, timeout=2.0)
-                    # Resume
+                    # Seek a context where addr's page is mapped (CHESS scheduled).
+                    mapped = False
+                    for _ in range(seek_budget):
+                        if self._addr_mapped(s, addr):
+                            mapped = True
+                            break
+                        self._resample_context(s)
+                    resp = ""
+                    if mapped:
+                        # Still halted in the mapped context: write + verify here.
+                        s.sendall(self._pkt(f"M{addr:x},1:{value:02x}"))
+                        self._recv_pkt(s, timeout=2.0)
+                        s.sendall(self._pkt(f"m{addr:x},1"))
+                        resp = self._recv_pkt(s, timeout=2.0)
+                    # Resume the guest.
                     s.sendall(self._pkt("c"))
-                    s.settimeout(5.0)
+                    s.settimeout(0.3)
                     try:
                         s.recv(64)
                     except (socket.timeout, OSError):
                         pass
-                # Check the read-back: must be exactly the byte we wrote.
-                if (resp and len(resp) >= 2
-                        and all(c in "0123456789abcdefABCDEF" for c in resp[:2])):
-                    actual = int(resp[:2], 16)
-                    if actual == (value & 0xff):
-                        if attempt > 0:
-                            print(f"  write_byte: landed on attempt {attempt+1}",
-                                  flush=True)
-                        return True
+                if self._is_byte(resp) and int(resp, 16) == (value & 0xff):
+                    if attempt > 0:
+                        print(f"  write_byte: landed on attempt {attempt+1}",
+                              flush=True)
+                    return True
             except Exception:
                 pass
             if attempt < max_retries - 1:
                 time.sleep(0.1)
         return False
+
+    def write_u32_verified(self, addr: int, value: int,
+                           extra_reads: list[tuple[int, int]] | None = None,
+                           max_retries: int = 30,
+                           ) -> tuple[bool, int, list[bytes]]:
+        """Write a 4-byte LE U32 and verify via read-back, retrying on wrong-MMU
+        context (same failure mode write_byte handles).
+
+        Returns ``(ok, value_post, extra)`` where:
+          - ok:         True if the read-back equals *value*
+          - value_post: the U32 actually read back (-1 on persistent failure)
+          - extra:      one bytes per (addr,len) in *extra_reads*; b"" on failure
+
+        All ops share one halt per attempt, matching writes_and_reads, so MMU
+        context is consistent across the write + verification read + extras.
+        Each retry resumes the CPU briefly so guest scheduling can move us into
+        the right userspace context for the next halt.
+        """
+        extra_reads = extra_reads or []
+        verify_idx = 0   # position of the verification read in the reads list
+        all_reads = [(addr, 4)] + list(extra_reads)
+        last_extra: list[bytes] = [b""] * len(extra_reads)
+        last_post = -1
+
+        for attempt in range(max_retries):
+            results = self.writes_and_reads(writes=[(addr, value)], reads=all_reads)
+            v_raw = results[verify_idx] if len(results) > verify_idx else b""
+            if len(v_raw) >= 4:
+                last_post = struct.unpack_from("<I", v_raw)[0]
+                last_extra = [results[i] if i < len(results) else b""
+                              for i in range(1, 1 + len(extra_reads))]
+                if last_post == value:
+                    if attempt > 0:
+                        print(f"  write_u32: landed on attempt {attempt+1}",
+                              flush=True)
+                    return True, last_post, last_extra
+            # MMU context wrong (or transient socket failure) — let the guest
+            # run briefly so a context switch lands us in CHESS userspace.
+            if attempt < max_retries - 1:
+                time.sleep(0.1)
+        return False, last_post, last_extra
 
 
 # Low-level client
@@ -424,6 +520,7 @@ class InjectionSpec:
     symbol: str = ""       # demangled symbol name (optional)
     byte_offset: int = 0   # byte offset within the symbol
     field_name: str = ""   # DWARF field name within the symbol (optional)
+    section: str = ""      # ELF section (.bss/.data/.text/.rodata), optional
 
 
 @dataclass
@@ -1835,6 +1932,14 @@ class SEUCampaign:
                 elf_path=self.cfg.elf_path,
                 recovery_path=result.recovery_path,
                 recovery_time_s=result.recovery_time_s,
+                # Prefer the sampler's labels: it resolved them with the stable
+                # (release) ELF for addresses + debug ELF DWARF for fields.  The
+                # addr stored is a release address, so re-resolving it against
+                # cfg.elf_path (debug ELF) mislabels every result.
+                symbol_name=result.spec.symbol or None,
+                field_name=result.spec.field_name or None,
+                byte_offset=result.spec.byte_offset,
+                section=result.spec.section or None,
             )
 
     def print_summary(self) -> None:
@@ -1881,13 +1986,26 @@ class SEUCampaign:
             print(f"    NO_INJECT (failed) : {n_noinject}  "
                   f"(plugin never reported trigger fired — not real data)")
             print(f"  Effective injections : {effective}")
+        # Layer-5 is only meaningful if the golden critical-params set was built
+        # at boot.  When build failed (empty/None), every MASKED skipped the
+        # integrity check, so we must NOT claim it was verified.
+        _l5_active = bool(self.cfg.critical_params)
+        _masked_note = ("Layer-5 verified - truly absorbed" if _l5_active
+                        else "Layer-5 DISABLED this run - NOT verified")
         print(f"   1. CRASH            : {n_crash}")
         print(f"   2. DETECTED         : {n_detected}")
-        print(f"   3. MASKED           : {n_masked}    (Layer-5 verified - truly absorbed)")
+        print(f"   3. MASKED           : {n_masked}    ({_masked_note})")
         print(f"   4. MASKED_CRITICAL  : {n_critical}    (Layer-5 found silent corruption)")
         print(f"   5. PAIRWISE (state) : {len(pairwise_violations)}  "
               f"(EA x OBC invariant violation)")
         print("─────────────────────────────────────────────────────")
+
+        if not _l5_active:
+            print("  !! Layer-5 GOLDEN check was DISABLED for this run "
+                  "(critical-params build failed at boot).")
+            print("     MASKED results are liveness-only - silent corruption "
+                  "would NOT have been detected. Re-run to re-enable.")
+            print("─────────────────────────────────────────────────────")
 
         if critical_results:
             print("\n  MASKED_CRITICAL — silent corruption (Layer-5 divergence):")
@@ -1911,65 +2029,3 @@ class SEUCampaign:
                 print(f"  {outcome:<16} rate : {pct:5.1f}%  (of {effective} effective)")
         print(f"  Results file        : {self.cfg.results_path}")
         print("─────────────────────────────────────────────────────")
-
-
-# CLI: quick manual injection
-
-def _cli() -> None:
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="Schedule a single SEU bit-flip via the fault_inject plugin."
-    )
-    parser.add_argument("--socket", default="/tmp/fault_inject.sock",
-                        help="Path to plugin control socket")
-    sub = parser.add_subparsers(dest="cmd", required=True)
-
-    # inject
-    p_inj = sub.add_parser("inject", help="Schedule a bit-flip")
-    p_inj.add_argument("--addr", required=True,
-                       help="Guest vaddr (hex or dec)")
-    p_inj.add_argument("--bit", type=int, required=True,
-                       help="Bit index 0-7")
-    p_inj.add_argument("--delay", type=int, default=5_000_000,
-                       help="Instructions from now (default 5M)")
-
-    # count
-    sub.add_parser("count", help="Print current instruction count")
-
-    # result
-    sub.add_parser("result", help="Print last injection result")
-
-    # clear
-    sub.add_parser("clear", help="Cancel pending injection")
-
-    args = parser.parse_args()
-
-    with FaultInjectorClient(args.socket) as fi:
-        if args.cmd == "count":
-            cnt = fi.get_count()
-            print(f"insn_count = {cnt:,}")
-
-        elif args.cmd == "inject":
-            addr = int(args.addr, 0)
-            trigger = fi.inject_mem(addr=addr, bit=args.bit, delay=args.delay)
-            print(f"Scheduled: addr=0x{addr:08x} bit={args.bit} "
-                  f"trigger_insn={trigger:,}")
-            print("Waiting for injection result...")
-            r = fi.wait_for_result(timeout=60.0, trigger_insn=trigger)
-            if r:
-                print(json.dumps(r, indent=2))
-            else:
-                print("Timed out waiting for result.")
-
-        elif args.cmd == "result":
-            r = fi.last_result()
-            print(json.dumps(r, indent=2) if r else "No result yet.")
-
-        elif args.cmd == "clear":
-            fi.clear()
-            print("Cleared.")
-
-
-if __name__ == "__main__":
-    _cli()

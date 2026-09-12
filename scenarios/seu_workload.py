@@ -12,8 +12,6 @@ What this script drives:
     Health::Run        — indirectly, by keeping component queues busy so a
                           missed ping (from corruption) actually trips
                           warnCycles within the observation window.
-    M4B switching      — periodic CPU mux toggles exercise the failover code
-                          path.
 
 """
 from __future__ import annotations
@@ -117,19 +115,11 @@ def stress_bfield(rng: random.Random, nc: NestClient) -> str:
     return f"B_field profile len={len(profile)}"
 
 
-def stress_mux_toggle(rng: random.Random, nc: NestClient) -> str:
-    # M4B mux: switch the OBC perspective between CPU_A and CPU_B.
-    # Exercises the switching code path on every toggle.
-    nc.send_command("M4B", "switch_back_to_a7a", "{}")
-    return "M4B → A7A switch"
-
-
 STIMULI = [
     stress_temperature,
     stress_accel,
     stress_omega,
     stress_bfield,
-    stress_mux_toggle,
 ]
 
 

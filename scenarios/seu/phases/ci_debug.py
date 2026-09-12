@@ -48,7 +48,7 @@ _STABLE_ELF_PATH: Path | None = (
     Path(os.environ["CHESS_STABLE_ELF_PATH"])
     if os.environ.get("CHESS_STABLE_ELF_PATH") else None
 )
-from ..helpers import print_banner
+from ..helpers import print_banner, wait_for_beacon, ensure_beacon
 from ..pairwise import PairwiseHook
 
 
@@ -82,6 +82,29 @@ def _event_signatures(lines: list[str]) -> set[tuple[str, str, str]]:
         if m:
             sigs.add((m.group("sev"), m.group("comp"), m.group("etype")))
     return sigs
+
+
+def _wait_health_readable(gdb: "GdbMemWriter", npe_addr: int,
+                          max_tries: int = 120) -> bool:
+    """Poll m_numPingEntries until it reads a sane value in the caught MMU
+    context, so the subsequent health write actually lands.
+
+    After a per-injection system_reset the health page may not be paged in /
+    initialised yet, and a random GDB halt often catches a non-CHESS context -
+    the write then silently misses and a DETECTED is mis-recorded as MASKED.
+    Confirming a sane read first means CHESS health context is live; the write
+    that follows (itself retry-verified) then catches it.  Jittered to avoid
+    aliasing with the ~1 Hz schedule.  Returns True once health is readable.
+    """
+    import random as _rnd
+    for _ in range(max_tries):
+        rb  = gdb.read_bulk([(npe_addr, 2)])
+        npe = (struct.unpack_from("<H", rb[0][:2])[0]
+               if rb and rb[0] and len(rb[0]) >= 2 else -1)
+        if 1 <= npe <= 64:        # MAX_HEALTH_SLOTS-class sanity bound
+            return True
+        time.sleep(0.15 + _rnd.random() * 0.25)
+    return False
 
 
 def _capture_golden(oracle: PtyOracle, duration_s: float = 10.0) -> GoldenFingerprint:
@@ -330,6 +353,12 @@ def _run_hlth_ping_warn(syms: list[SymbolInfo],
     _npe_addr    = _health_base + 14480   # m_numPingEntries (U16, DWARF-verified offset)
     print(f"  Health cycleCount addr: 0x{cc_addr:08x}  health_base: 0x{_health_base:08x}", flush=True)
 
+    # Gate on health being readable before writing, else the write silently
+    # misses (wrong MMU context / health not yet paged in after reset) and the
+    # WARN is mis-recorded as MASKED.
+    if not _wait_health_readable(_gdb, _npe_addr):
+        print("  WARNING: health page not readable after gate — write may miss", flush=True)
+
     spec = InjectionSpec(addr=cc_addr, bit=0, delay=0,
                          symbol=f"CdhCore::health (PingTracker[{comp_name}])",
                          byte_offset=0, field_name="cycleCount")
@@ -341,32 +370,34 @@ def _run_hlth_ping_warn(syms: list[SymbolInfo],
 
     oracle.drain()
 
-    # Write cycleCount=warnCycles AND read back diagnostics in one GDB halt session
-    # to avoid the "wrong MMU context" issue that plagues separate read_bulk calls.
+    # Write cycleCount=warnCycles with retry-verify against the wrong-MMU-context
+    # failure mode: GDB may halt the vCPU in a kernel/ISR window where CHESS's
+    # userspace page is not mapped, so the M/m pair targets a stale TLB entry.
+    # write_u32_verified resumes-and-retries until the read-back matches, same
+    # pattern as write_byte uses for the sweep's bit-flips.  m_numPingEntries
+    # is read in the same halt window as the verification read.
     t0 = time.monotonic()
-    _rb_write = _gdb.writes_and_reads(
-        writes=[(cc_addr, _PING_WARN_CYCLES)],
-        reads=[(cc_addr, 4), (_npe_addr, 4)],
+    write_ok, cc_post_write, extras = _gdb.write_u32_verified(
+        cc_addr, _PING_WARN_CYCLES,
+        extra_reads=[(_npe_addr, 4)],
     )
-    _cc_raw  = _rb_write[0] if _rb_write and _rb_write[0] else b""
-    _npe_raw = _rb_write[1] if _rb_write and len(_rb_write) > 1 and _rb_write[1] else b""
-    cc_post_write = struct.unpack_from("<I", _cc_raw)[0] if len(_cc_raw) >= 4 else -1
+    _npe_raw = extras[0] if extras else b""
     _npe_val = struct.unpack_from("<H", _npe_raw[:2])[0] if len(_npe_raw) >= 2 else -1
     print(f"  cycleCount post-write: {cc_post_write}  m_numPingEntries: {_npe_val}", flush=True)
+    if not write_ok:
+        print(f"  WARNING: write did not verify after retries (cc_post_write={cc_post_write})",
+              flush=True)
+    # writes_and_reads sends 'c' but QEMU 10.x sometimes leaves the CPU halted
+    # if the ACK doesn't arrive in time.  resume_cpu is idempotent (no-op if
+    # already running) and clears that race before the observation window.
+    _gdb.resume_cpu()
 
-    # Same 2s instruction-count crash check as --ci
-    # Primary CRASH detector: if the vCPU stops advancing within 2 s of the
-    # write, the outcome is CRASH regardless of the event stream.  For WARN
-    # this should never fire (CHESS stays alive); if it does, report truthfully.
-    #
-    # Guard: if the post-write reads returned -1 (GDB session failure / wrong MMU
-    # context), the write may not have landed and the CPU may still be in a GDB
-    # halt from a previous session.  Skip the instruction count check in that case
-    # to avoid a false CRASH from delta=0 (halted-not-crashed).
-    _gdb_ok = (cc_post_write != -1)
+    # 2 s instruction-count crash check.  Unconditional now that write_ok is
+    # the only signal for "did the write land" — the insn count tells us
+    # whether the vCPU is actually executing CHESS in the observation window.
     _crash_by_count = False
     _insn_delta = -1
-    if fi_sock is not None and _gdb_ok:
+    if fi_sock is not None:
         try:
             with FaultInjectorClient(fi_sock) as _fi:
                 _c0 = _fi.get_count()
@@ -381,13 +412,14 @@ def _run_hlth_ping_warn(syms: list[SymbolInfo],
             print(f"  WARNING: insn count check failed: {_e}", flush=True)
             time.sleep(2.0)
     else:
-        if not _gdb_ok:
-            print("  GDB reads failed — skipping insn count check, using oracle only",
-                  flush=True)
         time.sleep(2.0)   # maintain same timing as --ci even without the check
 
     if _crash_by_count:
-        _gdb.writes_and_reads(writes=[(cc_addr, 0)], reads=[])
+        # Best-effort reset in case the vCPU is only briefly halted and CHESS
+        # would otherwise see cycleCount=warnCycles on the next tick.  Same
+        # verified-write helper as the success path.
+        _gdb.write_u32_verified(cc_addr, 0)
+        _gdb.resume_cpu()
         elapsed = time.monotonic() - t0
         return InjectionResult(
             spec=spec, trigger_insn=0, success=(cc_post_write == _PING_WARN_CYCLES),
@@ -410,7 +442,10 @@ def _run_hlth_ping_warn(syms: list[SymbolInfo],
           flush=True)
 
     # Reset cycleCount to prevent the follow-on HLTH_PING_LATE FATAL.
-    _gdb.writes_and_reads(writes=[(cc_addr, 0)], reads=[])
+    # Verified write: a silent failure here lets the next Health::Run see
+    # cycleCount > fatalCycles and crash CHESS before the campaign moves on.
+    _gdb.write_u32_verified(cc_addr, 0)
+    _gdb.resume_cpu()
     print("  cycleCount reset to 0", flush=True)
 
     # Determine outcome: oracle event takes priority; fall back to cycleCount delta.
@@ -473,6 +508,12 @@ def _run_hlth_ping_fatal(syms: list[SymbolInfo],
     print(f"  health_base: 0x{_health_base:08x}  vtable ptr addr: 0x{vtable_addr:08x}",
           flush=True)
 
+    # Gate on health being readable so the vtable write lands (else a "CRASH"
+    # could come from a halted vCPU rather than the intended virtual-dispatch
+    # fault, or the write misses and we mis-record MASKED).
+    if not _wait_health_readable(_gdb, _health_base + 14480):
+        print("  WARNING: health page not readable after gate — write may miss", flush=True)
+
     spec = InjectionSpec(addr=vtable_addr, bit=0, delay=0,
                          symbol="CdhCore::health (vtable ptr)",
                          byte_offset=0, field_name="vtable")
@@ -485,22 +526,24 @@ def _run_hlth_ping_fatal(syms: list[SymbolInfo],
     oracle.drain()
     t0 = time.monotonic()
 
-    # Zero the vtable pointer: next Health::Run virtual dispatch → PC=0 → crash.
-    _rb_write = _gdb.writes_and_reads(
-        writes=[(vtable_addr, 0)],
-        reads=[(vtable_addr, 4)],
-    )
-    _vt_raw  = _rb_write[0] if _rb_write and _rb_write[0] else b""
-    vt_post  = struct.unpack_from("<I", _vt_raw)[0] if len(_vt_raw) >= 4 else -1
-    print(f"  vtable ptr post-write: 0x{vt_post:08x}  (expect 0x00000000)", flush=True)
+    # Zero the vtable pointer with retry-verify: same wrong-MMU-context failure
+    # mode as HLTH_PING_WARN.  Without the retry the write may not land, and
+    # the resulting "CRASH" would come from a halted vCPU rather than the
+    # intended virtual-dispatch fault — right answer for the wrong reason.
+    write_ok, vt_post, _ = _gdb.write_u32_verified(vtable_addr, 0)
+    print(f"  vtable ptr post-write: 0x{vt_post & 0xffffffff:08x}  "
+          f"(expect 0x00000000)", flush=True)
+    if not write_ok:
+        print(f"  WARNING: vtable write did not verify after retries", flush=True)
+    _gdb.resume_cpu()  # clear QEMU-10 stuck-halt race
 
-    # Same 2s instruction-count crash check as --ci
-    # Health::Run fires every 4 s.  The crash may land within the 2 s window
-    # (fast path → CRASH immediately) or after it (slow path → oracle liveness).
-    _gdb_ok = (vt_post != -1)
+    # 2 s instruction-count crash check.  Health::Run fires every Run-tick
+    # (1 s on Pathfinder0FS rg2).  Fast path: the very next virtual dispatch
+    # crashes during this window → low insn delta → CRASH.  Slow path: the
+    # crash lands after the window → oracle liveness catches the silence.
     _crash_by_count = False
     _insn_delta = -1
-    if fi_sock is not None and _gdb_ok:
+    if fi_sock is not None:
         try:
             with FaultInjectorClient(fi_sock) as _fi:
                 _c0 = _fi.get_count()
@@ -515,9 +558,6 @@ def _run_hlth_ping_fatal(syms: list[SymbolInfo],
             print(f"  WARNING: insn count check failed: {_e}", flush=True)
             time.sleep(2.0)
     else:
-        if not _gdb_ok:
-            print("  GDB reads failed — skipping insn count check, using oracle only",
-                  flush=True)
         time.sleep(2.0)
 
     if _crash_by_count:
@@ -1118,17 +1158,12 @@ def run_ci_debug(args) -> None:
         # capturing the baseline. This is needed in Docker mode where NEST
         # reports "running" as soon as QEMU launches, but CHESS takes up to
         # 90 s more to boot and start the FPrime event loop.
-        _boot_deadline = time.monotonic() + 120.0
-        print("  Waiting for sustained CHESS event flow…", flush=True)
-        while time.monotonic() < _boot_deadline:
-            _snap = _golden_oracle.recent_lines(200)
-            _ev_count = sum(1 for l in _snap if "EVENT:" in (l or ""))
-            if _ev_count >= 3:
-                print(f"  CHESS active ({_ev_count} EVENT: lines) ✓", flush=True)
-                break
-            time.sleep(2.0)
+        print("  Ensuring active CHESS beacon (PACKET_SENT advancing)…", flush=True)
+        if ensure_beacon(_golden_oracle, GDB_HOST):
+            print("  CHESS beacon active ✓", flush=True)
         else:
-            print("  WARNING: timed out waiting for CHESS events — proceeding", flush=True)
+            print("  WARNING: beacon not advancing even after reset proceeding "
+                  "(golden may be empty / first injection may false-CRASH)", flush=True)
         golden = _capture_golden(_golden_oracle, duration_s=golden_duration)
     finally:
         _golden_oracle.stop()
@@ -1351,20 +1386,13 @@ def run_ci_debug(args) -> None:
                         # Wait for sustained CHESS event flow (not just one event),
                         # so the CPU is firmly in CHESS user-context — not stuck
                         # in early init where BSS isn't mapped yet.
-                        print("  Waiting for sustained CHESS event flow after reset…",
+                        print("  Waiting for active CHESS beacon after reset…",
                               flush=True)
                         write_oracle.drain()
-                        _boot_dl = time.monotonic() + 120.0
-                        while time.monotonic() < _boot_dl:
-                            _lines = write_oracle.recent_lines(200)
-                            _ev_count = sum(1 for l in _lines if "EVENT:" in (l or ""))
-                            if _ev_count >= 3:
-                                print(f"  CHESS active ({_ev_count} EVENT: lines) ✓",
-                                      flush=True)
-                                break
-                            time.sleep(2.0)
+                        if wait_for_beacon(write_oracle, timeout_s=120.0):
+                            print("  CHESS beacon active ✓", flush=True)
                         else:
-                            print("  WARNING: timed out waiting for CHESS after reset",
+                            print("  WARNING: beacon not advancing after reset (120s)",
                                   flush=True)
                         # Extra settle so the CPU has time to leave any
                         # transient kernel-context window between events.

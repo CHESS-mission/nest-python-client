@@ -113,6 +113,31 @@ def main() -> None:
                              "--vtable-skip 0 to include those targets — recommended for "
                              "radiation-realistic --sweep runs where you want CRASH outcomes "
                              "to appear in the distribution.")
+    # --code: SEU into code / rodata instead of .bss/.data state
+    parser.add_argument("--code", action="store_true",
+                        help="--ci: sample bit-flips uniformly per byte over code/rodata "
+                             "sections (see --sections) of the RUNNING (release) ELF instead "
+                             "of CHESS:: .bss/.data state.  Targets are labelled with the "
+                             "containing function/symbol.  High CRASH/hang yield.")
+    parser.add_argument("--sections", metavar="LIST", default="text,rodata",
+                        help="--code: comma-separated sections to sample "
+                             "(default 'text,rodata'; e.g. 'text' for code only).")
+    parser.add_argument("--vtables", action="store_true",
+                        help="--code: restrict sampling to vtable (_ZTV*) symbols - the "
+                             "highest crash-yield control-flow target.")
+    parser.add_argument("--crash-probe", action="store_true",
+                        help="--ci: prepend one directed target that corrupts the MSB of "
+                             "the --ci-filter component's vtable pointer (object offset 0), "
+                             "forcing a guaranteed CRASH row through the sampling pipeline. "
+                             "Pair with --ci-filter on an actively-scheduled component.")
+    parser.add_argument("--code-filter", metavar="REGEX", default=None,
+                        help="--code: restrict sampling to symbols whose demangled name "
+                             "matches REGEX (e.g. 'RateGroup|transceiver').  Aims flips at "
+                             "code you know executes; sampled per byte, weighted by size.")
+    parser.add_argument("--code-prologue", type=int, default=None, metavar="N",
+                        help="--code: confine flips to the first N bytes of each symbol "
+                             "(the function prologue), which execute on EVERY call - use "
+                             "with --code-filter to guarantee hitting executed instructions.")
     # --batch group-testing sweep
     parser.add_argument("--batch", action="store_true",
                         help="--ci / --sweep: group-testing batch mode.  Pools multiple "

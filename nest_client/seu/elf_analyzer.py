@@ -695,6 +695,109 @@ def get_bituniform_sample(elf_path: Path,
     return targets
 
 
+def get_code_sample(elf_path: Path,
+                    n: int,
+                    rng,
+                    sections: tuple[str, ...] = (".text", ".rodata"),
+                    vtables_only: bool = False,
+                    name_re: str | None = None,
+                    max_offset: int | None = None) -> list[dict]:
+    """Per-byte-uniform SEU sample over code / rodata sections.
+
+    Unlike the .bss/.data path, this reads the *running* (release) ELF directly:
+    the binary executing in QEMU is not stripped, so .text/.rodata addresses and
+    symbol names are exact and need no debug-ELF remap.  Pass the release ELF as
+    *elf_path*.
+
+    Sampling is uniform per byte (radiation-like): a section is chosen with
+    probability proportional to its byte size, then a byte and bit uniformly.
+    Each target is labelled with the containing symbol (demangled) + offset, or
+    "<section>+0xNNN" for bytes no symbol covers (padding, literal pools, unnamed
+    const data).  With *vtables_only*, sampling is restricted to vtable (_ZTV*)
+    symbols - the highest crash-yield control-flow target.
+
+    Returns a list of dicts with the same keys the campaign's InjectionSpec
+    builder expects: addr, bit, symbol, byte_offset, field, plus component,
+    section and stable_key for reporting / cross-version comparison.
+    """
+    import bisect
+
+    # 1. Section ranges from the ELF that actually executes in QEMU.  Skip
+    #    SHT_NOBITS (.bss has no file content; this path is for code/rodata).
+    sec_ranges: list[tuple[str, int, int]] = []
+    with elf_path.open("rb") as f:
+        elf = ELFFile(f)
+        for name in sections:
+            s = elf.get_section_by_name(name)
+            if s is not None and s["sh_size"] > 0 and s["sh_type"] != "SHT_NOBITS":
+                sec_ranges.append((name, s["sh_addr"], s["sh_size"]))
+    if not sec_ranges:
+        return []
+
+    # 2. Symbol interval index for labelling (FUNC in .text, OBJECT in .rodata).
+    syms = [s for s in analyze_cached(elf_path)
+            if s.section in sections and s.size > 0
+            and s.sym_type in ("FUNC", "OBJECT")]
+    syms.sort(key=lambda s: s.address)
+    starts = [s.address for s in syms]
+
+    def _label(addr: int, sec_name: str, sec_addr: int) -> tuple[str, int]:
+        i = bisect.bisect_right(starts, addr) - 1
+        if 0 <= i < len(syms):
+            s = syms[i]
+            if s.address <= addr < s.address + s.size:
+                return s.demangled, addr - s.address
+        return sec_name, addr - sec_addr
+
+    targets: list[dict] = []
+
+    # Restricted pool: vtables and/or a name regex narrow sampling to specific
+    # symbols (e.g. hot functions), sampled per byte but weighted by symbol size.
+    # This is the directed mode - aim flips at code you know executes.
+    pool = syms
+    if vtables_only:
+        pool = [s for s in pool if s.name.startswith("_ZTV")]
+    if name_re:
+        _nre = re.compile(name_re)
+        pool = [s for s in pool if _nre.search(s.demangled)]
+
+    if vtables_only or name_re:
+        if not pool:
+            return []
+        weights = [s.size for s in pool]
+        for _ in range(n):
+            s   = rng.choices(pool, weights=weights, k=1)[0]
+            # max_offset confines flips to the function prologue (offset 0..N),
+            # the instructions executed on EVERY call regardless of which switch
+            # case runs - the surest way to hit code that actually executes.
+            hi  = s.size if max_offset is None else max(1, min(max_offset, s.size))
+            off = rng.randint(0, hi - 1)
+            bit = rng.randint(0, 7)
+            targets.append({
+                "addr": s.address + off, "bit": bit,
+                "symbol": s.demangled, "byte_offset": off,
+                "field": "", "component": s.demangled, "section": s.section,
+                "stable_key": f"{s.demangled}::{off}::{bit}",
+            })
+        return targets
+
+    # Per-byte uniform across the requested sections (radiation-like).
+    weights = [sz for (_, _, sz) in sec_ranges]
+    for _ in range(n):
+        name, sec_addr, sec_size = rng.choices(sec_ranges, weights=weights, k=1)[0]
+        off  = rng.randint(0, sec_size - 1)
+        addr = sec_addr + off
+        bit  = rng.randint(0, 7)
+        label, boff = _label(addr, name, sec_addr)
+        targets.append({
+            "addr": addr, "bit": bit,
+            "symbol": label, "byte_offset": boff,
+            "field": "", "component": label, "section": name,
+            "stable_key": f"{label}::{boff}::{bit}",
+        })
+    return targets
+
+
 def get_stable_component_sample(
     elf_path: Path,
     total_quota: int,
@@ -789,8 +892,9 @@ def get_stable_component_sample(
     for sym in symbols:
         remainder = sym.demangled[len(filter_prefix):]
         comp = re.split(r"[<:]", remainder)[0]
-        if comp:
-            comp_syms.setdefault(comp, []).append(sym)
+        if not comp:
+            comp = sym.demangled
+        comp_syms.setdefault(comp, []).append(sym)
 
     # Resolve DWARF fields for all symbols at once (one DWARF parse).
     # Skipped entirely in byte-uniform mode (vtable_skip == 0): we want to hit
@@ -901,6 +1005,7 @@ def get_stable_component_sample(
                 "field":       field_name,
                 "byte_offset": field_offset + byte_in_field,
                 "component":   comp,
+                "section":     sym.section,
                 "stable_key":  f"{sym.demangled}::{field_name or ''}::{bit_in_field}",
             })
 

@@ -14,6 +14,7 @@ once their offsets are known.
 from __future__ import annotations
 
 import os
+import random
 import struct
 import time
 from dataclasses import dataclass
@@ -89,10 +90,22 @@ def find_health_entry0_addr(syms: list[SymbolInfo]) -> int | None:
         return None
     return health.address + PING_ENTRY_ARRAY_OFFSET
 
+_GOLDEN_BUILD_RETRIES = 120
+
+
+def _context_poll_sleep() -> None:
+    """Let the guest run a jittered interval before the next halt attempt.
+
+    A fixed delay can alias with CHESS's ~1 Hz rate-group schedule, so we keep
+    re-sampling the same execution phase and never catch userspace.  Jitter
+    breaks that harmonic so successive halts land in different phases.
+    """
+    time.sleep(0.15 + random.random() * 0.25)
+
 
 def build_health_critical_params(syms: list[SymbolInfo],
                                   gdb,
-                                  max_retries: int = 30) -> list[CriticalParam]:
+                                  max_retries: int = _GOLDEN_BUILD_RETRIES) -> list[CriticalParam]:
     """Resolve + snapshot Health watchdog table from a clean CHESS.
 
     Auto-sized - the loop registers exactly the components Health is monitoring
@@ -144,7 +157,7 @@ def build_health_critical_params(syms: list[SymbolInfo],
                     print(f"  critical-params phase 1: caught CHESS context on attempt {attempt+1}",
                           flush=True)
                 break
-        time.sleep(0.2)
+        _context_poll_sleep()
     if npe_val is None:
         print(f"  WARNING: critical-params phase 1 (npe/vtable) failed after {max_retries} retries "
               "- Layer-5 disabled", flush=True)
@@ -168,7 +181,7 @@ def build_health_critical_params(syms: list[SymbolInfo],
                 print(f"  critical-params phase 2: caught CHESS context on attempt {attempt+1}",
                       flush=True)
             break
-        time.sleep(0.2)
+        _context_poll_sleep()
     else:
         print(f"  WARNING: critical-params phase 2 (entries) failed after {max_retries} retries "
               "- Layer-5 disabled", flush=True)

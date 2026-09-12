@@ -438,21 +438,46 @@ class SEUResultDB:
         elf_path: Path | None = None,
         recovery_path: str | None = None,
         recovery_time_s: float | None = None,
+        symbol_name: str | None = None,
+        field_name: str | None = None,
+        byte_offset: int | None = None,
+        section: str | None = None,
     ) -> None:
         """
-        Store one injection result.  If elf_path is provided the address is
-        resolved to a (symbol, field, bit_within_field) stable key.
-        """
-        info: AddrInfo | None = None
-        if elf_path is not None:
-            try:
-                info = self._enricher(elf_path).lookup(addr)
-            except Exception:
-                pass
+        Store one injection result, resolved to a (symbol, field, bit) stable key.
 
-        fbo = None
-        if info is not None and info.field_bit_offset is not None:
-            fbo = info.field_bit_offset + bit
+        Prefer caller-supplied labels (``symbol_name``/``field_name``/
+        ``byte_offset``/``section``): the sampler already resolved them with the
+        stable (release) ELF for addresses and the debug ELF's DWARF for fields.
+        Only when no label is supplied do we fall back to resolving ``addr``
+        against ``elf_path`` -- which is wrong whenever ``addr`` is a release
+        address but ``elf_path`` is the debug ELF (the layouts differ), the bug
+        that mislabelled every row of a remapped run as one symbol.
+        """
+        if symbol_name is not None:
+            # Symbol-relative absolute bit offset is the stable comparison key
+            # (field_offset isn't carried separately by the sampler).
+            sym_name = symbol_name
+            fld_name = field_name
+            b_off    = byte_offset
+            fld_off  = None
+            sec      = section
+            fbo      = (byte_offset * 8 + bit) if byte_offset is not None else None
+        else:
+            info: AddrInfo | None = None
+            if elf_path is not None:
+                try:
+                    info = self._enricher(elf_path).lookup(addr)
+                except Exception:
+                    pass
+            sym_name = info.symbol_name if info else None
+            fld_name = info.field_name if info else None
+            b_off    = info.byte_offset if info else None
+            fld_off  = info.field_offset if info else None
+            sec      = info.section if info else None
+            fbo      = (info.field_bit_offset + bit
+                        if info is not None and info.field_bit_offset is not None
+                        else None)
 
         self._con.execute(
             """INSERT INTO results
@@ -463,12 +488,7 @@ class SEUResultDB:
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 run_id, addr, bit,
-                info.byte_offset if info else None,
-                info.symbol_name if info else None,
-                info.field_name if info else None,
-                info.field_offset if info else None,
-                fbo,
-                info.section if info else None,
+                b_off, sym_name, fld_name, fld_off, fbo, sec,
                 original, flipped, int(write_ok), outcome,
                 evidence or "", insn_count, elapsed_s,
                 recovery_path or "", recovery_time_s,

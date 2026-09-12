@@ -6,12 +6,13 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-from nest_client.seu.elf_analyzer import get_stable_component_sample, analyze_cached as analyze
+from nest_client.seu.elf_analyzer import (get_stable_component_sample, get_code_sample,
+                                          analyze_cached as analyze)
 from nest_client.seu.injector import CampaignConfig, SEUCampaign, InjectionSpec, GdbMemWriter
 from nest_client.seu.critical_params import build_health_critical_params
 
 from ..config import ELF_PATH, SOCK_PATH, SEU_DB, RESULTS, _docker_mode, PTY_LOG, CONSOLE_LOG, GDB_HOST, NEST_URL
-from ..helpers import print_banner
+from ..helpers import print_banner, ensure_beacon
 from ..pairwise import PairwiseHook
 
 
@@ -39,15 +40,35 @@ def run_ci(args) -> None:
     # the namespace-scoped sample that --ci uses.  --per-component is forbidden
     # in sweep mode (the whole point of sweep is byte-weighted sampling).
     sweep_mode = getattr(args, "sweep", False)
+    code_mode  = getattr(args, "code", False)
     if sweep_mode and per_component:
         sys.exit("ERROR: --per-component cannot be combined with --sweep "
                  "(sweep is radiation-like proportional sampling by design)")
 
-    if sweep_mode:
+    # --code samples code/rodata of the running release ELF, not .bss/.data
+    # state.  Sections come from --sections; default text,rodata.
+    _code_sections = tuple(
+        "." + s.strip().lstrip(".")
+        for s in (getattr(args, "sections", None) or "text,rodata").split(",")
+        if s.strip()
+    )
+    _vtables_only = getattr(args, "vtables", False)
+    _code_filter  = getattr(args, "code_filter", None)
+
+    if code_mode:
+        if _vtables_only:
+            _what = "vtables only"
+        elif _code_filter:
+            _what = f"symbols matching /{_code_filter}/"
+        else:
+            _what = ",".join(_code_sections)
+        print_banner(f"SEU Code/Rodata Sweep  "
+                     f"(per byte over {_what}  quota={total_quota}  seed={seed})")
+    elif sweep_mode:
         ci_filter  = ""
         ci_exclude = None
         print_banner(f"SEU Radiation-Like Sweep  "
-                     f"(uniform across .bss/.data  quota={total_quota}  seed={seed})")
+                     f"(all regions .bss/.data/.text/.rodata  quota={total_quota}  seed={seed})")
     elif per_component:
         print_banner(f"SEU CI Regression Check  "
                      f"(per-component={per_component}  seed={seed})")
@@ -78,32 +99,97 @@ def run_ci(args) -> None:
     # should appear in proportion to their physical footprint.
     _vtable_skip = getattr(args, "vtable_skip", 64)
 
-    targets, comp_quotas = get_stable_component_sample(
-        ELF_PATH,
-        total_quota=total_quota,
-        seed=seed,
-        filter_prefix=ci_filter,
-        exclude_re=ci_exclude,
-        stable_elf_path=_stable_elf_path,
-        vtable_skip=_vtable_skip,
-        per_component_quota=per_component,
-    )
+    if code_mode:
+        # Code/rodata SEU samples the running (release) ELF directly - its
+        # .symtab is intact, so addresses and names are exact (no remap).
+        import random as _random
+        from collections import Counter as _Counter
+        _code_elf = _stable_elf_path or ELF_PATH
+        targets = get_code_sample(
+            _code_elf, total_quota, _random.Random(seed),
+            sections=_code_sections, vtables_only=_vtables_only,
+            name_re=_code_filter, max_offset=getattr(args, "code_prologue", None),
+        )
+        ci_filter = ""
+        comp_quotas = dict(_Counter(t["section"] for t in targets))
+        _dist_desc = ("vtables only" if _vtables_only
+                      else f"matching /{_code_filter}/" if _code_filter
+                      else "uniform per byte over code/rodata")
+        _flt_disp = f"<{','.join(_code_sections)} of {_code_elf.name}>"
+    elif sweep_mode:
+        # Radiation-like sweep across ALL allocatable regions: .bss/.data
+        # (state) AND .text/.rodata (code).  Quota is split between the data and
+        # code samplers in proportion to each region's byte size, so .text (the
+        # largest region) gets the most samples -- matching the physical SEU
+        # cross-section.  Both feed the same engine/classification as --ci.
+        import random as _random
+        from collections import Counter as _Counter
+        from elftools.elf.elffile import ELFFile as _ELFFile
+        _sweep_elf = _stable_elf_path or ELF_PATH
+        _rsz = {}
+        with open(_sweep_elf, "rb") as _f:
+            _ef = _ELFFile(_f)
+            for _sn in (".text", ".rodata", ".bss", ".data"):
+                _sec = _ef.get_section_by_name(_sn)
+                _rsz[_sn] = _sec["sh_size"] if _sec else 0
+        _code_bytes = _rsz[".text"] + _rsz[".rodata"]
+        _data_bytes = _rsz[".bss"] + _rsz[".data"]
+        _tot_bytes  = (_code_bytes + _data_bytes) or 1
+        _code_q = round(total_quota * _code_bytes / _tot_bytes)
+        _data_q = total_quota - _code_q
+        # Data portion: all .bss/.data symbols (filter cleared for sweep).
+        if _data_q > 0:
+            targets, comp_quotas = get_stable_component_sample(
+                ELF_PATH, total_quota=_data_q, seed=seed,
+                filter_prefix="", exclude_re=None,
+                stable_elf_path=_stable_elf_path, vtable_skip=_vtable_skip,
+                per_component_quota=per_component,
+            )
+            targets = list(targets)
+        else:
+            targets, comp_quotas = [], {}
+        # Code portion: .text + .rodata of the running (release) ELF.
+        if _code_q > 0:
+            _code_targets = get_code_sample(
+                _sweep_elf, _code_q, _random.Random(seed),
+                sections=(".text", ".rodata"),
+            )
+            targets += _code_targets
+            for _t in _code_targets:
+                comp_quotas[_t["section"]] = comp_quotas.get(_t["section"], 0) + 1
+        ci_filter = ""
+        _dist_desc = (f"all regions, size-proportional: {_data_q} data "
+                      f"(.bss/.data) + {_code_q} code (.text/.rodata)")
+        _flt_disp = f"<all .bss/.data/.text/.rodata of {_sweep_elf.name}>"
+    else:
+        targets, comp_quotas = get_stable_component_sample(
+            ELF_PATH,
+            total_quota=total_quota,
+            seed=seed,
+            filter_prefix=ci_filter,
+            exclude_re=ci_exclude,
+            stable_elf_path=_stable_elf_path,
+            vtable_skip=_vtable_skip,
+            per_component_quota=per_component,
+        )
+        _dist_desc = (f"uniform per component"
+                      if per_component else "proportional by injectable bytes")
+        _flt_disp = f"{ci_filter}*" if ci_filter else "<all .bss/.data symbols (sweep mode)>"
 
     if not targets:
-        _flt_disp = f"'{ci_filter}*'" if ci_filter else "<all symbols>"
-        print(f"  No symbols found matching {_flt_disp}. Nothing to inject.")
+        print("  No targets produced. Nothing to inject.")
         sys.exit(0)
 
     n_comps = len(comp_quotas)
-    _flt_disp = f"{ci_filter}*" if ci_filter else "<all .bss/.data symbols (sweep mode)>"
-    _dist_desc = (f"uniform per component"
-                  if per_component else "proportional by injectable bytes")
     print(f"  Filter     : {_flt_disp}")
-    print(f"  Components : {n_comps}")
+    print(f"  {'Sections' if code_mode else 'Components'} : {n_comps}")
     print(f"  Targets    : {len(targets)}  ({_dist_desc})")
     print()
     for comp in sorted(comp_quotas):
-        print(f"    {comp_quotas[comp]:3d}x  {ci_filter}{comp}")
+        # comp is normally the suffix after ci_filter, but the fully-qualified
+        # fallback (and code-mode section names) already carry the full label.
+        _label = comp if comp.startswith(ci_filter) else f"{ci_filter}{comp}"
+        print(f"    {comp_quotas[comp]:3d}x  {_label}")
     print()
 
     # Use the file-chardev console log when available (Docker mode).
@@ -146,6 +232,7 @@ def run_ci(args) -> None:
         results_path            = RESULTS,
         db_path                 = SEU_DB,
         use_insn_count_liveness = False,   # always use event oracle for DETECTED
+        liveness_timeout_s      = 5.0,
         gdb_host                = GDB_HOST if _docker_mode else None,
         gdb_port                = 1234,
         nest_url                = NEST_URL if _docker_mode else None,
@@ -164,30 +251,18 @@ def run_ci(args) -> None:
         campaign.setup_snapshot("chess_ready")
 
     # Layer-5 critical-params build (shared with --ci-debug)
-    # Wait for sustained CHESS event flow first — otherwise the GDB halt for
-    # the builder lands in kernel/Phoenix context and the BSS reads return
-    # empty.  Same pattern --ci-debug uses before its golden capture.
     if _docker_mode and GDB_HOST:
-        import time as _time
         from nest_client.seu.injector import PtyOracle, GdbMemWriter as _GdbW
         _oracle_log_for_wait = CONSOLE_LOG if CONSOLE_LOG is not None else PTY_LOG
         _wait_oracle = PtyOracle(_oracle_log_for_wait)
         _wait_oracle.start()
         try:
-            _boot_dl = _time.monotonic() + 120.0
-            print("  Waiting for sustained CHESS event flow before Layer-5 build…",
-                  flush=True)
-            while _time.monotonic() < _boot_dl:
-                _ev = sum(1 for l in _wait_oracle.recent_lines(200)
-                          if "EVENT:" in (l or ""))
-                if _ev >= 3:
-                    print(f"  CHESS active ({_ev} EVENT: lines) ✓", flush=True)
-                    break
-                _time.sleep(2.0)
+            print("  Ensuring active CHESS beacon before Layer-5 build…", flush=True)
+            if ensure_beacon(_wait_oracle, GDB_HOST):
+                print("  CHESS beacon active ✓", flush=True)
             else:
-                print("  WARNING: timed out waiting for CHESS — Layer-5 may be skipped",
-                      flush=True)
-            _time.sleep(3.0)   # extra settle for CPU to leave any transient kernel window
+                print("  WARNING: beacon not advancing even after reset — "
+                      "Layer-5 may be skipped", flush=True)
         finally:
             _wait_oracle.stop()
 
@@ -204,10 +279,32 @@ def run_ci(args) -> None:
         InjectionSpec(
             addr=t["addr"], bit=t["bit"], delay=args.delay,
             symbol=t["symbol"], byte_offset=t["byte_offset"],
-            field_name=t.get("field", ""),
+            field_name=t.get("field", ""), section=t.get("section", ""),
         )
         for t in targets
     ]
+
+    if getattr(args, "crash_probe", False) and not code_mode:
+        _probe_elf = _stable_elf_path or ELF_PATH
+        _cands = [s for s in analyze(_probe_elf)
+                  if s.demangled.startswith(ci_filter)
+                  and s.section == ".bss" and s.size >= 4]
+        # main object = least-nested demangled name under the filter
+        _cands.sort(key=lambda s: (len(s.demangled), s.demangled))
+        if _cands:
+            _base = _cands[0].address
+            specs.insert(0, InjectionSpec(
+                addr=_base + 3, bit=7, delay=args.delay,
+                symbol=f"{_cands[0].demangled} (vtable ptr MSB - crash-probe)",
+                byte_offset=3, field_name="vtable", section=".bss",
+            ))
+            print(f"  Crash-probe: {_cands[0].demangled} vtable ptr @ "
+                  f"0x{_base:08x} (flip byte3 bit7 -> unmapped dispatch -> CRASH)",
+                  flush=True)
+        else:
+            print(f"  WARNING: --crash-probe found no .bss object matching "
+                  f"'{ci_filter}'; skipping probe", flush=True)
+
     if getattr(args, "batch", False):
         campaign.run_batch_sweep(
             specs=specs,
