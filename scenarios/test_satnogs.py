@@ -39,7 +39,7 @@ def test_satnogs_status_off():
 def test_satnogs_status_idle():
     """Status is 'idle' after UHF is enabled but before RX starts."""
     with timeline() as t:
-        t[1 * s] = command("Satnogs", "COMMS_ENABLE_UHF", "")
+        t[1 * s] = command("Satnogs", "COMMS_ENABLE_TRANSCEIVER", "")
         t[2 * s] = command("Satnogs", "COMMS_GET_STATUS", "")
         t[2 * s] = event("Satnogs", "status") \
             .where(lambda d: d["state"] == "idle") \
@@ -50,8 +50,8 @@ def test_satnogs_status_idle():
 def test_satnogs_status_rx():
     """Status is 'rx' after UHF is enabled and RX started."""
     with timeline() as t:
-        t[1 * s] = command("Satnogs", "COMMS_ENABLE_UHF", "")
-        t[2 * s] = command("Satnogs", "COMMS_START_UHF_RX", "")
+        t[1 * s] = command("Satnogs", "COMMS_ENABLE_TRANSCEIVER", "")
+        t[2 * s] = command("Satnogs", "COMMS_START_TRANSCEIVER_RX", "")
         t[3 * s] = command("Satnogs", "COMMS_GET_STATUS", "")
         t[3 * s] = event("Satnogs", "status") \
             .where(lambda d: d["state"] == "rx") \
@@ -62,7 +62,7 @@ def test_satnogs_status_rx():
 def test_satnogs_status_safe():
     """Status is 'safe' after entering safe mode."""
     with timeline() as t:
-        t[1 * s] = command("Satnogs", "COMMS_ENABLE_UHF", "")
+        t[1 * s] = command("Satnogs", "COMMS_ENABLE_TRANSCEIVER", "")
         t[2 * s] = command("Satnogs", "COMMS_ENTER_SAFE_MODE", "")
         t[3 * s] = command("Satnogs", "COMMS_GET_STATUS", "")
         t[3 * s] = event("Satnogs", "status") \
@@ -76,9 +76,9 @@ def test_satnogs_status_safe():
 def test_satnogs_uhf_enable_disable():
     """Disabling UHF also stops RX."""
     with timeline() as t:
-        t[1 * s] = command("Satnogs", "COMMS_ENABLE_UHF", "")
-        t[2 * s] = command("Satnogs", "COMMS_START_UHF_RX", "")
-        t[3 * s] = command("Satnogs", "COMMS_DISABLE_UHF", "")
+        t[1 * s] = command("Satnogs", "COMMS_ENABLE_TRANSCEIVER", "")
+        t[2 * s] = command("Satnogs", "COMMS_START_TRANSCEIVER_RX", "")
+        t[3 * s] = command("Satnogs", "COMMS_DISABLE_TRANSCEIVER", "")
         t[4 * s] = command("Satnogs", "COMMS_GET_STATUS", "")
         t[4 * s] = event("Satnogs", "status") \
             .where(lambda d: d["state"] == "off") \
@@ -89,11 +89,11 @@ def test_satnogs_uhf_enable_disable():
 
 @scenario(topology_file="./satnogs.yaml")
 def test_satnogs_stop_rx():
-    """COMMS_STOP_UHF_RX returns to idle."""
+    """COMMS_STOP_TRANSCEIVER_RX returns to idle."""
     with timeline() as t:
-        t[1 * s] = command("Satnogs", "COMMS_ENABLE_UHF", "")
-        t[2 * s] = command("Satnogs", "COMMS_START_UHF_RX", "")
-        t[3 * s] = command("Satnogs", "COMMS_STOP_UHF_RX", "")
+        t[1 * s] = command("Satnogs", "COMMS_ENABLE_TRANSCEIVER", "")
+        t[2 * s] = command("Satnogs", "COMMS_START_TRANSCEIVER_RX", "")
+        t[3 * s] = command("Satnogs", "COMMS_STOP_TRANSCEIVER_RX", "")
         t[4 * s] = command("Satnogs", "COMMS_GET_STATUS", "")
         t[4 * s] = event("Satnogs", "status") \
             .where(lambda d: d["state"] == "idle") \
@@ -104,8 +104,8 @@ def test_satnogs_stop_rx():
 def test_satnogs_stop_rf():
     """COMMS_STOP_RF stops reception."""
     with timeline() as t:
-        t[1 * s] = command("Satnogs", "COMMS_ENABLE_UHF", "")
-        t[2 * s] = command("Satnogs", "COMMS_START_UHF_RX", "")
+        t[1 * s] = command("Satnogs", "COMMS_ENABLE_TRANSCEIVER", "")
+        t[2 * s] = command("Satnogs", "COMMS_START_TRANSCEIVER_RX", "")
         t[3 * s] = command("Satnogs", "COMMS_STOP_RF", "")
         t[4 * s] = command("Satnogs", "COMMS_GET_STATUS", "")
         t[4 * s] = event("Satnogs", "status") \
@@ -115,11 +115,11 @@ def test_satnogs_stop_rf():
 
 @scenario(topology_file="./satnogs.yaml")
 def test_satnogs_reset_radio():
-    """COMMS_RESET_UHF_RADIO returns to off."""
+    """COMMS_RESET_TRANSCEIVER_RADIO returns to off."""
     with timeline() as t:
-        t[1 * s] = command("Satnogs", "COMMS_ENABLE_UHF", "")
-        t[2 * s] = command("Satnogs", "COMMS_START_UHF_RX", "")
-        t[3 * s] = command("Satnogs", "COMMS_RESET_UHF_RADIO", "")
+        t[1 * s] = command("Satnogs", "COMMS_ENABLE_TRANSCEIVER", "")
+        t[2 * s] = command("Satnogs", "COMMS_START_TRANSCEIVER_RX", "")
+        t[3 * s] = command("Satnogs", "COMMS_RESET_TRANSCEIVER_RADIO", "")
         t[4 * s] = command("Satnogs", "COMMS_GET_STATUS", "")
         t[4 * s] = event("Satnogs", "status") \
             .where(lambda d: d["state"] == "off") \
@@ -171,11 +171,11 @@ def test_satnogs_flush_queue():
 
 @scenario(topology_file="./satnogs.yaml")
 def test_satnogs_uhf_status():
-    """COMMS_GET_UHF_STATUS reflects current radio flags."""
+    """COMMS_GET_TRANSCEIVER_STATUS reflects current radio flags."""
     with timeline() as t:
-        t[1 * s] = command("Satnogs", "COMMS_ENABLE_UHF", "")
-        t[2 * s] = command("Satnogs", "COMMS_START_UHF_RX", "")
-        t[3 * s] = command("Satnogs", "COMMS_GET_UHF_STATUS", "")
+        t[1 * s] = command("Satnogs", "COMMS_ENABLE_TRANSCEIVER", "")
+        t[2 * s] = command("Satnogs", "COMMS_START_TRANSCEIVER_RX", "")
+        t[3 * s] = command("Satnogs", "COMMS_GET_TRANSCEIVER_STATUS", "")
         t[3 * s] = event("Satnogs", "uhf_status") \
             .where(lambda d: d["enabled"] == True and d["receiving"] == True) \
             .expect(within=2 * s)
@@ -183,14 +183,14 @@ def test_satnogs_uhf_status():
 
 @scenario(topology_file="./satnogs.yaml")
 def test_satnogs_link_stats():
-    """COMMS_GET_UHF_LINK_STATS and COMMS_CLEAR_UHF_LINK_STATS work correctly."""
+    """COMMS_GET_TRANSCEIVER_LINK_STATS and COMMS_CLEAR_TRANSCEIVER_LINK_STATS work correctly."""
     with timeline() as t:
-        t[1 * s] = command("Satnogs", "COMMS_GET_UHF_LINK_STATS", "")
+        t[1 * s] = command("Satnogs", "COMMS_GET_TRANSCEIVER_LINK_STATS", "")
         t[1 * s] = event("Satnogs", "uhf_link_stats") \
             .where(lambda d: d["rx_count"] == 0 and d["tx_count"] == 0) \
             .expect(within=2 * s)
-        t[3 * s] = command("Satnogs", "COMMS_CLEAR_UHF_LINK_STATS", "")
-        t[4 * s] = command("Satnogs", "COMMS_GET_UHF_LINK_STATS", "")
+        t[3 * s] = command("Satnogs", "COMMS_CLEAR_TRANSCEIVER_LINK_STATS", "")
+        t[4 * s] = command("Satnogs", "COMMS_GET_TRANSCEIVER_LINK_STATS", "")
         t[4 * s] = event("Satnogs", "uhf_link_stats") \
             .where(lambda d: d["rx_count"] == 0 and d["tx_count"] == 0) \
             .expect(within=2 * s)
@@ -244,8 +244,8 @@ def test_satnogs_abort_tx():
 def test_satnogs_safe_mode_stops_rx():
     """Entering safe mode stops active RX."""
     with timeline() as t:
-        t[1 * s] = command("Satnogs", "COMMS_ENABLE_UHF", "")
-        t[2 * s] = command("Satnogs", "COMMS_START_UHF_RX", "")
+        t[1 * s] = command("Satnogs", "COMMS_ENABLE_TRANSCEIVER", "")
+        t[2 * s] = command("Satnogs", "COMMS_START_TRANSCEIVER_RX", "")
         t[3 * s] = command("Satnogs", "COMMS_ENTER_SAFE_MODE", "")
         t[4 * s] = command("Satnogs", "COMMS_GET_STATUS", "")
         t[4 * s] = event("Satnogs", "status") \
@@ -257,7 +257,7 @@ def test_satnogs_safe_mode_stops_rx():
 def test_satnogs_exit_safe_mode():
     """Exiting safe mode returns to idle."""
     with timeline() as t:
-        t[1 * s] = command("Satnogs", "COMMS_ENABLE_UHF", "")
+        t[1 * s] = command("Satnogs", "COMMS_ENABLE_TRANSCEIVER", "")
         t[2 * s] = command("Satnogs", "COMMS_ENTER_SAFE_MODE", "")
         t[3 * s] = command("Satnogs", "COMMS_EXIT_SAFE_MODE", "")
         t[4 * s] = command("Satnogs", "COMMS_GET_STATUS", "")
@@ -323,7 +323,7 @@ def test_satnogs_reset_reason():
 def test_satnogs_state_change_status():
     """State change status tracks previous and current state."""
     with timeline() as t:
-        t[1 * s] = command("Satnogs", "COMMS_ENABLE_UHF", "")
+        t[1 * s] = command("Satnogs", "COMMS_ENABLE_TRANSCEIVER", "")
         t[2 * s] = command("Satnogs", "COMMS_GET_STATE_CHANGE_STATUS", "")
         t[2 * s] = event("Satnogs", "state_change_status") \
             .where(lambda d: d["previous_state"] == "off" and d["current_state"] == "idle") \
